@@ -1,0 +1,53 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+
+# PyTorch model files and large binaries
+models/*.pt
+models/*.pth
+
+# Outputs and temporary folders
+outputs/
+tmp/
+*.log
+*.tmp
+
+# IDE/editor settings
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Test / cache
+.pytest_cache/
+.mypy_cache/
+
+# Environment variables
+.env
+.env.*
+
+# Terminals / local state
+terminals/
+
+# Database
+*.sqlite3
+
