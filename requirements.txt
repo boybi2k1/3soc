@@ -3,3 +3,13 @@ uvicorn[standard]
 ultralytics
 opencv-python
 python-multipart
+websockets 
+psutil
+passlib[bcrypt]
+python-jose[cryptography]
+sqlalchemy
+passlib[bcrypt]
+pydantic[email]
+pymysql
+mysql-connector-python
+argon2-cffi
