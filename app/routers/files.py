@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File,
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session, joinedload
 from typing import List, Optional
+from datetime import datetime
 import os
 import shutil
 from pathlib import Path
@@ -312,6 +313,7 @@ def _load_violations_from_folder(violation_dir: Path, detection_id: str) -> list
     return violations
 
 
+
 @router.get("/{file_id}/detect-stream")
 def detect_file_stream(file_id: int, db: Session = Depends(get_db)):
     """
@@ -484,3 +486,66 @@ def detect_file_stream(file_id: int, db: Session = Depends(get_db)):
         yield f"data: {json.dumps({'type': 'complete', 'total_violations': len(violation_images)})}\n\n"
 
     return StreamingResponse(stream_detection(), media_type="text/event-stream")
+
+
+#  detect image
+@router.post("/detect-image")
+def detect_image(
+    file: UploadFile = File(...),
+    authorization: Optional[str] = Header(None)
+):
+    """
+    Upload an image file and run detection on it.
+    Returns detection results.
+    """
+    # Get user from token (optional)
+    user_id = None
+    try:
+        if authorization:
+            user_data = get_current_user_from_token(authorization)
+            user_id = user_data.get("user_id")
+    except Exception as e:
+        print(f"[FILES] Warning: Failed to get user from token: {e}")
+    
+    # Validate file type
+    if not file.content_type.startswith("image/"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Only image files are allowed"
+        )
+    
+    # Save uploaded image to a temp location
+    temp_dir = UPLOAD_DIR / "temp"
+    temp_dir.mkdir(exist_ok=True)
+    temp_image_path = temp_dir / f"{uuid4()}_{file.filename}"
+    
+    try:
+        with temp_image_path.open("wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+        
+        # Run detection
+        results = tasks.run_detection_on_image_temp(str(temp_image_path))
+        
+        return {
+            "filename": file.filename,
+            "detections": results,
+            "path": f"/uploads/temp/{temp_image_path.name}",
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "user_id": user_id
+        }
+    except Exception as e:
+        print(f"[FILES] Detection error: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Detection failed: {str(e)}"
+        )
+    finally:
+        # Clean up temp file
+        try:
+            if temp_image_path.exists():
+                temp_image_path.unlink()
+        except:
+            pass
+            

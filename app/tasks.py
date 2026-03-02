@@ -171,3 +171,32 @@ def run_detection_on_image(detection_id: str, image_path: str):
     except Exception as e:
         print(f"[TASKS] unexpected error: {e}")
         traceback.print_exc()
+
+
+def run_detection_on_image_temp(image_path: str) -> List[Dict[str, Any]]:
+    """
+    Run all models on a temporary image file and return detections immediately.
+    No DB save - just return results. Used for quick image detection from API.
+    """
+    aggregate_results = []
+    try:
+        for model_name, model in _MODELS.items():
+            try:
+                res_list = model(str(image_path))
+                if len(res_list) == 0:
+                    continue
+                res = res_list[0]
+                boxes = _boxes_from_result(res)
+                # attach model name and label to each box
+                for b in boxes:
+                    b["model"] = model_name
+                    b["label"] = model_name  # Add label for frontend
+                aggregate_results.extend(boxes)
+            except Exception as e:
+                print(f"[TASKS] error running model {model_name}: {e}")
+                traceback.print_exc()
+    except Exception as e:
+        print(f"[TASKS] unexpected error in run_detection_on_image_temp: {e}")
+        traceback.print_exc()
+    
+    return aggregate_results
