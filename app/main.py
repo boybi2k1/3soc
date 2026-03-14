@@ -11,18 +11,17 @@ from typing import List, Dict, Any
 import torch
 import logging
 import json
-import datetime
-import os
-import subprocess
+
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from app.websocket_handler import init_websocket_manager, get_websocket_manager
+from app.utils.websocket_handler import init_websocket_manager, get_websocket_manager
 from app.routers.users import router as users_router
 from app.routers.files import router as files_router
-from app.db import init_db, SessionLocal
-from app.models import User
-from app.auth import get_password_hash
+from app.db.db import init_db, SessionLocal
+from app.utils.auth import get_password_hash
+from app.db.models import User
+
 
 
 MODELS = {
@@ -45,6 +44,18 @@ DEVICE_STR = DEVICE
 logger = logging.getLogger("3soc")
 
 app = FastAPI(title="YOLO Flag Detection API")
+
+
+@app.middleware("http")
+async def add_uploads_cors_headers(request, call_next):
+    response = await call_next(request)
+    if request.url.path.startswith("/uploads/"):
+        origin = request.headers.get("origin")
+        response.headers["Access-Control-Allow-Origin"] = origin or "*"
+        response.headers["Vary"] = "Origin"
+        response.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+        response.headers["Access-Control-Allow-Headers"] = "*"
+    return response
 
 # Add CORS middleware
 app.add_middleware(
@@ -151,12 +162,10 @@ async def startup_event():
     except Exception as e:
         print(f"[WARN] Model warm-up failed: {e}")
     
-    # Initialize WebSocket manager with loaded models
+    # Initialize WebSocket manager with loaded models.
+    # Background tasks are started lazily when the first websocket client connects.
     ws_manager = init_websocket_manager(_LOADED_MODELS, DEVICE_STR)
     print(f"[INFO] WebSocket manager initialized with {len(_LOADED_MODELS)} models")
-    
-    # Start stats broadcast task
-    asyncio.create_task(ws_manager.broadcast_stats())
 
 
 @app.on_event("shutdown")
@@ -171,31 +180,83 @@ async def shutdown_event():
         print(f"[WARN] Error during shutdown: {e}")
     print("[INFO] Shutdown complete")
 
-
 @app.websocket("/realtime")
 async def websocket_endpoint(websocket: WebSocket):
-    """WebSocket endpoint for real-time frame detection"""
+
     ws_manager = get_websocket_manager()
+
     if not ws_manager:
         await websocket.close(code=1000, reason="WebSocket manager not initialized")
         return
-    
+
     await ws_manager.connect(websocket)
+
+    # start background tasks (stats + save worker)
+    await ws_manager.start_background_tasks()
+
     try:
+
         while True:
+
             data = await websocket.receive_text()
-            message = json.loads(data)
+
+            try:
+                message = json.loads(data)
+            except json.JSONDecodeError:
+                logger.warning("[WebSocket] Invalid JSON received")
+                continue
+
             message_type = message.get("type")
-            
+
             if message_type == "frame":
+
                 await ws_manager.handle_frame(websocket, message)
+
+            elif message_type == "ping":
+
+                await websocket.send_text(
+                    json.dumps({"type": "pong"})
+                )
+
             else:
-                logger.warning(f"[WebSocket] Unknown message type: {message_type}")
-    
+
+                logger.debug(f"[WebSocket] Unknown message type: {message_type}")
+
     except WebSocketDisconnect:
+
         ws_manager.disconnect(websocket)
         logger.info("[WebSocket] Client disconnected")
+
     except Exception as e:
+
         logger.error(f"[WebSocket] Error: {e}")
         ws_manager.disconnect(websocket)
+
+
+from fastapi.responses import StreamingResponse
+
+@app.get("/file-stream/{video_id}")
+async def stream_files(video_id: str):
+
+    ws_manager = get_websocket_manager()
+
+    queue = await ws_manager.register_sse(video_id)
+
+    async def event_stream():
+
+        try:
+
+            while True:
+
+                data = await queue.get()
+
+                yield f"data: {json.dumps({
+                    'type': 'violation',
+                    'data': data
+                })}\n\n"
+
+        except asyncio.CancelledError:
+            ws_manager.remove_sse(video_id)
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
 

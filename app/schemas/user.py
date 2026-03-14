@@ -1,6 +1,7 @@
 from pydantic import BaseModel, EmailStr
 from datetime import datetime
-from typing import Optional
+from typing import Optional, List
+from app.schemas.response import PaginationMeta
 
 
 class UserBase(BaseModel):
@@ -49,3 +50,8 @@ class ChangePasswordRequest(BaseModel):
 
 class LogoutResponse(BaseModel):
     message: str = "Logged out successfully"
+
+
+class UserListResponse(BaseModel):
+    items: List[UserResponse]
+    meta: PaginationMeta

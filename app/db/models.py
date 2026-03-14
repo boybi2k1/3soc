@@ -1,7 +1,7 @@
 from sqlalchemy import Column, Integer, String, DateTime, Text, JSON, Float, ForeignKey, Boolean
 from sqlalchemy.sql import func
 from sqlalchemy.orm import relationship
-from app.db import Base
+from app.db.db import Base
 
 
 class User(Base):
@@ -23,7 +23,7 @@ class User(Base):
 class VideoFile(Base):
     __tablename__ = "video_files"
     
-    id = Column(Integer, primary_key=True, index=True)
+    id = Column(String(64), primary_key=True, index=True)
     filename = Column(String(255), nullable=False)
     filepath = Column(String(500), nullable=False)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=True)

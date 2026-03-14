@@ -1,12 +1,15 @@
+from pydantic import json
 from ultralytics import YOLO
 from pathlib import Path
 import torch
-from app.db import SessionLocal
-from app.models import Detection
+from app.db.db import SessionLocal
+from app.db.models import Detection
 from typing import List, Dict, Any
 import traceback
 import cv2
 import numpy as np
+from app.config import UPLOAD_DIR
+
 
 # Configure device
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -200,3 +203,30 @@ def run_detection_on_image_temp(image_path: str) -> List[Dict[str, Any]]:
         traceback.print_exc()
     
     return aggregate_results
+
+def save_violation_frame(frame, detection_id, frame_number, timestamp, detections):
+
+    violation_dir = UPLOAD_DIR / "violations" / detection_id
+    violation_dir.mkdir(parents=True, exist_ok=True)
+
+    frame_filename = f"frame_{frame_number:05d}_ts{timestamp:.2f}.jpg"
+    frame_path = violation_dir / frame_filename
+
+    # save image
+    cv2.imwrite(str(frame_path), frame)
+
+    metadata_file = violation_dir / f"frame_{frame_number:05d}_metadata.json"
+
+    with open(metadata_file, "w") as f:
+        json.dump({
+            "frame_number": frame_number,
+            "timestamp": round(timestamp, 2),
+            "detections": detections
+        }, f)
+
+    return {
+        "frame_number": frame_number,
+        "timestamp": round(timestamp, 2),
+        "image_path": f"/uploads/violations/{detection_id}/{frame_filename}",
+        "detections": detections
+    }

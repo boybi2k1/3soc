@@ -13,7 +13,7 @@ Base = declarative_base()
 def init_db():
     # Import models here to register them with Base before create_all
     try:
-        import app.models  # noqa: F401
+        import app.db.models  # noqa: F401
     except Exception:
         pass
     Base.metadata.create_all(bind=engine)
@@ -21,8 +21,8 @@ def init_db():
 
 def seed_default_users():
     """Create default admin and user accounts if they don't exist"""
-    from app.models import User
-    from app.auth import get_password_hash
+    from app.db.models import User
+    from app.utils.auth import get_password_hash
     
     db = SessionLocal()
     try:

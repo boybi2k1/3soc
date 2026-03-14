@@ -1,26 +1,38 @@
-from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Header
+from fastapi import APIRouter, Depends, HTTPException, status, UploadFile,Form, File, Header, Query
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session, joinedload
 from typing import List, Optional
 from datetime import datetime
 import os
 import shutil
+import threading
+import queue
 from pathlib import Path
 from uuid import uuid4
 import cv2
 import json
-from app.db import SessionLocal
-from app.models import VideoFile, Detection
-from app.schemas.file import VideoFileCreate, VideoFileUpdate, VideoFileResponse
-from app.schemas.response import DetectionResult
-from app.auth import get_current_user_from_token
-from app import tasks
-
+from app.db.db import SessionLocal
+from app.db.models import VideoFile, Detection
+from app.schemas.file import VideoFileCreate, VideoFileUpdate, VideoFileResponse, VideoFileListResponse
+from app.utils.auth import get_current_user_from_token
+from app.utils import tasks
+from app.config import UPLOAD_DIR
 router = APIRouter(prefix="/files", tags=["files"])
 
-# Upload directory
-UPLOAD_DIR = Path("uploads")
-UPLOAD_DIR.mkdir(exist_ok=True)
+
+def _resolve_physical_video_path(file: VideoFile) -> Optional[Path]:
+    """Resolve physical video path from stored filepath, with legacy fallback."""
+    filename = os.path.basename(file.filepath or "")
+    direct = UPLOAD_DIR / filename
+    if direct.exists():
+        return direct
+
+    # Legacy rows may store "/uploads/<id>" without extension.
+    candidates = sorted(UPLOAD_DIR.glob(f"{filename}.*")) if filename else []
+    if candidates:
+        return candidates[0]
+
+    return None
 
 
 def get_db():
@@ -34,6 +46,7 @@ def get_db():
 @router.post("/upload", response_model=VideoFileResponse, status_code=status.HTTP_201_CREATED)
 async def upload_file(
     file: UploadFile = File(...),
+    video_id: str = Form(...),
     authorization: Optional[str] = Header(None),
     db: Session = Depends(get_db)
 ):
@@ -50,10 +63,11 @@ async def upload_file(
         )
     
     # Generate unique filename
-    timestamp = int(os.path.getmtime(__file__) * 1000) if os.path.exists(__file__) else 0
-    file_ext = Path(file.filename).suffix
-    unique_filename = f"{timestamp}_{file.filename}"
-    actual_path = UPLOAD_DIR / unique_filename
+    # timestamp = int(os.path.getmtime(__file__) * 1000) if os.path.exists(__file__) else 0
+    # file_ext = Path(file.filename).suffix
+    # unique_filename = f"{timestamp}_{file.filename}"
+    file_ext = Path(file.filename).suffix # Lấy .mp4, .mov...
+    actual_path = UPLOAD_DIR / f"{video_id}{file_ext}"
     
     # Save file
     try:
@@ -83,15 +97,16 @@ async def upload_file(
     
     # Create database record
     # Store web-accessible path for frontend
-    web_path = f"/uploads/{unique_filename}"
+    web_path = f"/uploads/{video_id}{file_ext}"
 
     db_file = VideoFile(
+        id=video_id,
         filename=file.filename,
         filepath=web_path,
         user_id=user_id,
         file_size=file_size,
         duration=duration,
-        status="uploaded"
+        # status="uploaded"
     )
     db.add(db_file)
     db.commit()
@@ -100,27 +115,62 @@ async def upload_file(
     return db_file
 
 
-@router.get("", response_model=List[VideoFileResponse])
-def get_files(skip: int = 0, limit: int = 100, authorization: Optional[str] = Header(None), db: Session = Depends(get_db)):
+@router.get("", response_model=VideoFileListResponse)
+def get_files(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(10, ge=1, le=100),
+    sort_order: str = Query("desc", pattern="^(asc|desc)$"),
+    skip: Optional[int] = Query(None, ge=0),
+    limit: Optional[int] = Query(None, ge=1, le=100),
+    authorization: Optional[str] = Header(None),
+    db: Session = Depends(get_db),
+):
     """Get list of files - users see only their own, admins see all"""
     # Get user from token
     user_data = get_current_user_from_token(authorization)
     user_id = user_data.get("user_id")
     role = user_data.get("role")
+
+    if limit is not None:
+        page_size = limit
+    if skip is not None:
+        page = (skip // page_size) + 1
+
+    offset = (page - 1) * page_size
     
     # Filter based on role
     if role == "admin":
         # Admin sees all files
-        files = db.query(VideoFile).options(joinedload(VideoFile.owner)).offset(skip).limit(limit).all()
+        base_query = db.query(VideoFile).options(joinedload(VideoFile.owner))
     else:
         # Regular users see only their own files
-        files = db.query(VideoFile).options(joinedload(VideoFile.owner)).filter(VideoFile.user_id == user_id).offset(skip).limit(limit).all()
-    
-    return files
+        base_query = db.query(VideoFile).options(joinedload(VideoFile.owner)).filter(VideoFile.user_id == user_id)
+
+    total = base_query.count()
+    total_pages = (total + page_size - 1) // page_size if total > 0 else 0
+
+    if sort_order == "asc":
+        base_query = base_query.order_by(VideoFile.created_at.asc())
+    else:
+        base_query = base_query.order_by(VideoFile.created_at.desc())
+
+    files = base_query.offset(offset).limit(page_size).all()
+
+    return {
+        "items": files,
+        "meta": {
+            "page": page,
+            "page_size": page_size,
+            "total": total,
+            "total_pages": total_pages,
+            "has_next": page < total_pages,
+            "has_prev": page > 1 and total_pages > 0,
+        },
+    }
 
 
 @router.delete("/{file_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_file(file_id: int, db: Session = Depends(get_db)):
+def delete_file(file_id: str, db: Session = Depends(get_db)):
     """Delete file"""
     file = db.query(VideoFile).filter(VideoFile.id == file_id).first()
     if not file:
@@ -130,9 +180,8 @@ def delete_file(file_id: int, db: Session = Depends(get_db)):
     try:
         # file.filepath is a web path like /uploads/<filename>
         # Resolve physical path by basename
-        filename = os.path.basename(file.filepath)
-        physical_path = UPLOAD_DIR / filename
-        if physical_path.exists():
+        physical_path = _resolve_physical_video_path(file)
+        if physical_path and physical_path.exists():
             physical_path.unlink()
     except Exception as e:
         print(f"Warning: Failed to delete physical file: {e}")
@@ -143,142 +192,8 @@ def delete_file(file_id: int, db: Session = Depends(get_db)):
     return None
 
 
-@router.post("/{file_id}/detect")
-def detect_file(file_id: int, db: Session = Depends(get_db)):
-    """
-    Run detection on video file.
-    - Check if violations folder exists → load from folder
-    - Otherwise process and save to folder
-    """
-    file = db.query(VideoFile).filter(VideoFile.id == file_id).first()
-    if not file:
-        raise HTTPException(status_code=404, detail="File not found")
 
-    # If already detected, load from folder
-    if file.detection_id:
-        violation_dir = UPLOAD_DIR / "violations" / file.detection_id
-        if violation_dir.exists():
-            print(f"[FILES] Loading cached detection from folder: {file.detection_id}")
-            violations = _load_violations_from_folder(violation_dir, file.detection_id)
-            return {
-                "detection_id": file.detection_id,
-                "total_frames": 0,
-                "processed_frames": len(violations),
-                "violation_count": len(violations),
-                "violations": violations,
-                "cached": True,
-            }
-
-    # Not cached, need to process
-    filename = os.path.basename(file.filepath)
-    video_path = UPLOAD_DIR / filename
-
-    if not video_path.exists():
-        raise HTTPException(status_code=404, detail="Physical file not found")
-
-    # Create detection ID and violation directory
-    detection_id = str(uuid4())
-    violation_dir = UPLOAD_DIR / "violations" / detection_id
-    violation_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Save detection_id to file record
-    file.detection_id = detection_id
-    db.add(file)
-    db.commit()
-    
-    print(f"[FILES] Starting detection: {detection_id}")
-    print(f"[FILES] Video path: {video_path}")
-
-    # Extract frames every 0.25 seconds (4 frames per second)
-    cap = cv2.VideoCapture(str(video_path))
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    frame_interval = int(fps * 0.25)  # Extract every 0.25s
-    
-    print(f"[FILES] Video: {total_frames} frames, {fps} fps, interval={frame_interval}")
-
-    # Process frames
-    violation_images = []
-    frame_count = 0
-    processed_frame_count = 0
-    
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        
-        # Extract every N frames (0.25s interval)
-        if frame_count % frame_interval == 0:
-            processed_frame_count += 1
-            timestamp = frame_count / fps
-            
-            # Run detection on this frame
-            frame_results = tasks.run_detection_on_frame(frame)
-            
-            # If there are detections, save the frame
-            if frame_results:
-                # Save violation frame first
-                frame_filename = f"frame_{processed_frame_count:05d}_ts{timestamp:.2f}.jpg"
-                frame_path = violation_dir / frame_filename
-                cv2.imwrite(str(frame_path), frame)
-                
-                # Check if this frame is a duplicate of previous frames
-                is_duplicate = tasks._is_duplicate_frame(str(frame_path), violation_images)
-                
-                if is_duplicate:
-                    print(f"[FILES] Frame {processed_frame_count} @ {timestamp:.2f}s - Duplicate, skipping")
-                    try:
-                        frame_path.unlink()
-                    except:
-                        pass
-                    frame_count += 1
-                    continue
-                
-                # Compute perceptual hash
-                frame_hash = tasks._compute_image_hash(str(frame_path))
-                
-                # Save violation record (only if not duplicate)
-                violation_record = {
-                    "frame_number": processed_frame_count,
-                    "timestamp": round(timestamp, 2),
-                    "image_path": f"/uploads/violations/{detection_id}/{frame_filename}",
-                    "detections": frame_results,
-                    "_hash": frame_hash,
-                }
-                violation_images.append(violation_record)
-                
-                # Save metadata JSON (only if not duplicate)
-                metadata_file = violation_dir / f"frame_{processed_frame_count:05d}_metadata.json"
-                with open(metadata_file, 'w') as f:
-                    json.dump({
-                        "frame_number": processed_frame_count,
-                        "timestamp": round(timestamp, 2),
-                        "detections": frame_results,
-                    }, f)
-                
-                print(f"[FILES] Frame {processed_frame_count} @ {timestamp:.2f}s - {len(frame_results)} detections (saved)")
-        
-        frame_count += 1
-    
-    cap.release()
-
-    # Remove internal _hash field
-    for v in violation_images:
-        v.pop("_hash", None)
-
-    print(f"[FILES] Detection complete: {len(violation_images)} unique violation frames found")
-    
-    return {
-        "detection_id": detection_id,
-        "total_frames": total_frames,
-        "processed_frames": processed_frame_count,
-        "violation_count": len(violation_images),
-        "violations": violation_images,
-        "cached": False,
-    }
-
-
-def _load_violations_from_folder(violation_dir: Path, detection_id: str) -> list:
+def _load_violations_from_folder(violation_dir: Path, video_id: str) -> list:
     """Load violation images and metadata from folder."""
     violations = []
     
@@ -289,11 +204,24 @@ def _load_violations_from_folder(violation_dir: Path, detection_id: str) -> list
         try:
             with open(metadata_file, 'r') as f:
                 metadata = json.load(f)
-            
-            # Get corresponding image
-            frame_num = metadata.get("frame_number", 0)
-            image_filename = f"frame_{frame_num:05d}_ts{metadata.get('timestamp', 0):.2f}.jpg"
+
+            # Try image name derived from metadata file first (supports legacy ts_* format).
+            image_filename = metadata_file.name.replace("_metadata.json", ".jpg")
             image_path = violation_dir / image_filename
+
+            # Fallback to current frame_* naming if needed.
+            if not image_path.exists():
+                frame_num = metadata.get("frame_number", 0)
+                image_filename = f"frame_{frame_num:05d}_ts{metadata.get('timestamp', 0):.2f}.jpg"
+                image_path = violation_dir / image_filename
+
+            # Last fallback: find any jpg that shares the metadata stem prefix.
+            if not image_path.exists():
+                stem_prefix = metadata_file.stem.replace("_metadata", "")
+                candidates = sorted(violation_dir.glob(f"{stem_prefix}*.jpg"))
+                if candidates:
+                    image_path = candidates[0]
+                    image_filename = image_path.name
             
             # Only add if image file exists
             if not image_path.exists():
@@ -303,7 +231,7 @@ def _load_violations_from_folder(violation_dir: Path, detection_id: str) -> list
             violation = {
                 "frame_number": metadata.get("frame_number"),
                 "timestamp": metadata.get("timestamp"),
-                "image_path": f"/uploads/violations/{detection_id}/{image_filename}",
+                "image_path": f"/uploads/violations/{video_id}/{image_filename}",
                 "detections": metadata.get("detections", []),
             }
             violations.append(violation)
@@ -313,180 +241,283 @@ def _load_violations_from_folder(violation_dir: Path, detection_id: str) -> list
     return violations
 
 
+def _has_cached_violations(violation_dir: Path) -> bool:
+    """Return True when a violation folder already has saved metadata records."""
+    if not violation_dir.exists() or not violation_dir.is_dir():
+        return False
+    return any(violation_dir.glob("*_metadata.json"))
+
+
+def _normalize_detections_for_ws_format(detections: list) -> list:
+    """Normalize detection payload to websocket-style bbox format."""
+    normalized = []
+
+    for det in detections or []:
+        if not isinstance(det, dict):
+            continue
+
+        # Already in websocket format.
+        if all(k in det for k in ("x", "y", "width", "height")):
+            normalized.append({
+                "x": int(det.get("x", 0)),
+                "y": int(det.get("y", 0)),
+                "width": int(det.get("width", 0)),
+                "height": int(det.get("height", 0)),
+                "label": det.get("label") or det.get("model") or "object",
+                "confidence": round(float(det.get("confidence", det.get("score", 0.0))), 4),
+            })
+            continue
+
+        # Convert xyxy format to websocket format.
+        if all(k in det for k in ("x1", "y1", "x2", "y2")):
+            x1 = float(det.get("x1", 0))
+            y1 = float(det.get("y1", 0))
+            x2 = float(det.get("x2", x1))
+            y2 = float(det.get("y2", y1))
+            normalized.append({
+                "x": int(x1),
+                "y": int(y1),
+                "width": int(max(0.0, x2 - x1)),
+                "height": int(max(0.0, y2 - y1)),
+                "label": det.get("label") or det.get("model") or "object",
+                "confidence": round(float(det.get("confidence", det.get("score", 0.0))), 4),
+            })
+
+    return normalized
+
+
 
 @router.get("/{file_id}/detect-stream")
-def detect_file_stream(file_id: int, db: Session = Depends(get_db)):
-    """
-    SSE endpoint to stream violations as they're detected.
-    Frontend can listen to this to get real-time updates.
-    """
+def detect_file_stream(file_id: str, db: Session = Depends(get_db)):
+
     file = db.query(VideoFile).filter(VideoFile.id == file_id).first()
     if not file:
         raise HTTPException(status_code=404, detail="File not found")
 
-    filename = os.path.basename(file.filepath)
-    video_path = UPLOAD_DIR / filename
+    video_path = _resolve_physical_video_path(file)
 
-    if not video_path.exists():
+    if not video_path or not video_path.exists():
         raise HTTPException(status_code=404, detail="Physical file not found")
 
-    # Reuse existing detection_id or create new one
-    detection_id = file.detection_id or str(uuid4())
-    violation_dir = UPLOAD_DIR / "violations" / detection_id
-    
-    # If already detected and cached, stream cached results
-    if file.detection_id and violation_dir.exists():
-        cached_violations = _load_violations_from_folder(violation_dir, detection_id)
-        
-        def stream_cached():
-            yield f"data: {json.dumps({'type': 'init', 'detection_id': detection_id})}\n\n"
-            yield f"data: {json.dumps({'type': 'metadata', 'total_frames': len(cached_violations), 'fps': None})}\n\n"
-            for v in cached_violations:
-                yield f"data: {json.dumps({'type': 'violation', 'data': v})}\n\n"
-            yield f"data: {json.dumps({'type': 'complete', 'total_violations': len(cached_violations)})}\n\n"
-        
-        return StreamingResponse(stream_cached(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "Connection": "keep-alive"})
+    violation_dir = UPLOAD_DIR / "violations" / file_id
 
-    # Not cached, need to process
+    # =========================
+    # STREAM CACHED RESULT
+    # =========================
+    if file.id and _has_cached_violations(violation_dir):
+
+        cached = _load_violations_from_folder(violation_dir, file_id)
+
+        def stream_cached():
+
+            yield f"data: {json.dumps({'type':'init','detection_id':file_id})}\n\n"
+
+            yield f"data: {json.dumps({'type':'metadata','total_frames':len(cached),'fps':None})}\n\n"
+
+            for v in cached:
+                yield f"data: {json.dumps({'type':'violation','data':v})}\n\n"
+
+            yield f"data: {json.dumps({'type':'complete','total_violations':len(cached)})}\n\n"
+
+        return StreamingResponse(
+            stream_cached(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no"
+            }
+        )
+
     violation_dir.mkdir(parents=True, exist_ok=True)
 
-    # Create a generator that yields SSE events
+    # =========================
+    # REALTIME DETECTION
+    # =========================
     def stream_detection():
-        # Save detection_id to file record if new
+
         db_new = SessionLocal()
+
         file_update = db_new.query(VideoFile).filter(VideoFile.id == file_id).first()
-        if file_update and not file_update.detection_id:
-            file_update.detection_id = detection_id
+        if file_update:
+            if not file_update.detection_id:
+                file_update.detection_id = file_id
             file_update.status = "processing"
             db_new.add(file_update)
             db_new.commit()
-        
-        # Create detection record
-        record = Detection(
-            detection_id=detection_id,
-            source=str(video_path),
-            results=[],
-            summary={"total_frames": 0, "processed_frames": 0},
-        )
-        db_new.add(record)
-        db_new.commit()
-        db_new.refresh(record)
-        
-        # Yield metadata
-        yield f"data: {json.dumps({'type': 'init', 'detection_id': detection_id})}\n\n"
 
-        # Extract frames
-        cap = cv2.VideoCapture(str(video_path))
-        fps = cap.get(cv2.CAP_PROP_FPS) or 30
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        frame_interval = int(fps * 0.25)
-        
-        yield f"data: {json.dumps({'type': 'metadata', 'total_frames': total_frames, 'fps': fps})}\n\n"
+        frame_queue = queue.Queue(maxsize=30)
+        result_queue = queue.Queue(maxsize=30)
+
+        stop_event = threading.Event()
+
+        worker_count = 1   # nếu GPU → 1, CPU → 2-4
 
         violation_images = []
-        frame_count = 0
-        processed_frame_count = 0
-        
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-            
-            if frame_count % frame_interval == 0:
-                processed_frame_count += 1
-                timestamp = frame_count / fps
-                
-                frame_results = tasks.run_detection_on_frame(frame)
-                
-                if frame_results:
-                    # Save frame first
-                    frame_filename = f"frame_{processed_frame_count:05d}_ts{timestamp:.2f}.jpg"
-                    frame_path = violation_dir / frame_filename
-                    cv2.imwrite(str(frame_path), frame)
-                    
-                    # Check for duplicate
-                    is_duplicate = tasks._is_duplicate_frame(str(frame_path), violation_images)
-                    
-                    if is_duplicate:
-                        print(f"[SSE] Frame {processed_frame_count} @ {timestamp:.2f}s - Duplicate, skipping")
-                        try:
-                            frame_path.unlink()
-                        except:
-                            pass
-                        frame_count += 1
-                        continue
-                    
-                    frame_hash = tasks._compute_image_hash(str(frame_path))
-                    
-                    violation_record = {
-                        "frame_number": processed_frame_count,
-                        "timestamp": round(timestamp, 2),
-                        "image_path": f"/uploads/violations/{detection_id}/{frame_filename}",
-                        "detections": frame_results,
-                        "_hash": frame_hash,
-                    }
-                    violation_images.append(violation_record)
-                    
-                    # Save metadata JSON
-                    metadata_file = violation_dir / f"frame_{processed_frame_count:05d}_metadata.json"
-                    with open(metadata_file, 'w') as f:
-                        json.dump({
-                            "frame_number": processed_frame_count,
-                            "timestamp": round(timestamp, 2),
-                            "detections": frame_results,
-                        }, f)
-                    
-                    # Yield violation via SSE
-                    violation_to_send = {
-                        "frame_number": violation_record["frame_number"],
-                        "timestamp": violation_record["timestamp"],
-                        "image_path": violation_record["image_path"],
-                        "detections": violation_record["detections"],
-                    }
-                    yield f"data: {json.dumps({'type': 'violation', 'data': violation_to_send})}\n\n"
-                    
-                    # Update DB
-                    record.results = violation_images
-                    record.summary = {
-                        "total_frames": total_frames,
-                        "processed_frames": processed_frame_count,
-                        "violation_count": len(violation_images),
-                    }
-                    db_new.add(record)
-                    db_new.commit()
-            
-            frame_count += 1
-        
-        cap.release()
-        
-        # Remove hashes
-        for v in violation_images:
-            v.pop("_hash", None)
-        
-        # Final update
-        record.results = violation_images
-        record.summary = {
-            "total_frames": total_frames,
-            "processed_frames": processed_frame_count,
-            "violation_count": len(violation_images),
-        }
-        db_new.add(record)
-        db_new.commit()
-        
-        # Update file
+
+        # -----------------------
+        # FRAME READER
+        # -----------------------
+        def read_frames():
+
+            cap = cv2.VideoCapture(str(video_path))
+
+            fps = cap.get(cv2.CAP_PROP_FPS) or 30
+            frame_interval = max(1, int(fps * 0.25))
+
+            frame_index = 0
+            sampled_index = 0
+
+            while not stop_event.is_set():
+
+                ret, frame = cap.read()
+                if not ret:
+                    break
+
+                if frame_index % frame_interval == 0:
+
+                    sampled_index += 1
+                    # Keep timestamp format aligned with websocket flow (milliseconds).
+                    timestamp = int(round((frame_index / fps) * 1000))
+
+                    frame_queue.put((sampled_index, timestamp, frame))
+
+                frame_index += 1
+
+            cap.release()
+
+            for _ in range(worker_count):
+                frame_queue.put(None)
+
+        # -----------------------
+        # DETECTION WORKER
+        # -----------------------
+        def detect_worker():
+
+            while not stop_event.is_set():
+
+                item = frame_queue.get()
+
+                if item is None:
+                    break
+
+                frame_number, timestamp, frame = item
+
+                try:
+
+                    results = tasks.run_detection_on_frame(frame)
+
+                    if results:
+                        normalized_results = _normalize_detections_for_ws_format(results)
+                        if not normalized_results:
+                            continue
+
+                        result_queue.put({
+                            "frame_number": frame_number,
+                            "timestamp": timestamp,
+                            "frame": frame,
+                            "detections": normalized_results
+                        })
+
+                except Exception as e:
+                    print("Detection error:", e)
+
+            result_queue.put({"type": "done"})
+
+        # -----------------------
+        # START THREADS
+        # -----------------------
+        reader = threading.Thread(target=read_frames, daemon=True)
+
+        workers = [
+            threading.Thread(target=detect_worker, daemon=True)
+            for _ in range(worker_count)
+        ]
+
+        reader.start()
+
+        for w in workers:
+            w.start()
+
+        # -----------------------
+        # INIT SSE
+        # -----------------------
+        yield f"data: {json.dumps({'type':'init','detection_id':file_id})}\n\n"
+
+        cap_meta = cv2.VideoCapture(str(video_path))
+        fps = cap_meta.get(cv2.CAP_PROP_FPS) or 30
+        total_frames = int(cap_meta.get(cv2.CAP_PROP_FRAME_COUNT))
+        cap_meta.release()
+
+        yield f"data: {json.dumps({'type':'metadata','total_frames':total_frames,'fps':fps})}\n\n"
+
+        done_count = 0
+
+        # -----------------------
+        # RESULT LOOP
+        # -----------------------
+        while done_count < worker_count:
+
+            try:
+                item = result_queue.get(timeout=1)
+            except queue.Empty:
+                continue
+
+            if item.get("type") == "done":
+                done_count += 1
+                continue
+
+            frame_number = item["frame_number"]
+            timestamp = item["timestamp"]
+            frame = item["frame"]
+            detections = item["detections"]
+
+            safe_ts = f"{timestamp:08.2f}"
+            frame_filename = f"ts_{safe_ts}_f{frame_number}.jpg"
+            frame_path = violation_dir / frame_filename
+
+            cv2.imwrite(str(frame_path), frame)
+
+            violation = {
+                "frame_number": frame_number,
+                "timestamp": round(timestamp,2),
+                "image_path": f"/uploads/violations/{file_id}/{frame_filename}",
+                "detections": detections
+            }
+
+            violation_images.append(violation)
+
+            metadata_file = violation_dir / f"ts_{safe_ts}_f{frame_number}_metadata.json"
+            with open(metadata_file, "w") as f:
+                json.dump({
+                    "frame_number": frame_number,
+                    "timestamp": round(timestamp, 2),
+                    "detections": detections,
+                }, f)
+
+            yield f"data: {json.dumps({'type':'violation','data':violation})}\n\n"
+
+        stop_event.set()
+
         file_update = db_new.query(VideoFile).filter(VideoFile.id == file_id).first()
         if file_update:
             file_update.status = "completed"
             db_new.add(file_update)
             db_new.commit()
-        
+
         db_new.close()
-        
-        # Yield completion
-        yield f"data: {json.dumps({'type': 'complete', 'total_violations': len(violation_images)})}\n\n"
 
-    return StreamingResponse(stream_detection(), media_type="text/event-stream")
+        yield f"data: {json.dumps({'type':'complete','total_violations':len(violation_images)})}\n\n"
 
+    return StreamingResponse(
+        stream_detection(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no"
+        }
+    )
 
 #  detect image
 @router.post("/detect-image")

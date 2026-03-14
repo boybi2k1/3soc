@@ -1,6 +1,7 @@
 from pydantic import BaseModel
 from datetime import datetime
-from typing import Optional
+from typing import Optional, List
+from app.schemas.response import PaginationMeta
 
 
 class UserInfoBasic(BaseModel):
@@ -29,7 +30,7 @@ class VideoFileUpdate(BaseModel):
 
 
 class VideoFileResponse(VideoFileBase):
-    id: int
+    id: str
     user_id: Optional[int] = None
     status: str
     created_at: datetime
@@ -37,3 +38,8 @@ class VideoFileResponse(VideoFileBase):
 
     class Config:
         from_attributes = True
+
+
+class VideoFileListResponse(BaseModel):
+    items: List[VideoFileResponse]
+    meta: PaginationMeta

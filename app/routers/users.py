@@ -1,10 +1,10 @@
-from fastapi import APIRouter, Depends, HTTPException, status, Header
+from fastapi import APIRouter, Depends, HTTPException, status, Header, Query
 from sqlalchemy.orm import Session
 from typing import List, Optional
-from app.db import SessionLocal
-from app.models import User
-from app.schemas.user import UserCreate, UserUpdate, UserResponse, LoginRequest, TokenResponse, ChangePasswordRequest, LogoutResponse
-from app.auth import get_password_hash, verify_password, create_access_token, decode_access_token, get_current_user_from_token, require_admin
+from app.db.db import SessionLocal
+from app.db.models import User
+from app.schemas.user import UserCreate, UserUpdate, UserResponse, LoginRequest, TokenResponse, ChangePasswordRequest, LogoutResponse, UserListResponse
+from app.utils.auth import get_password_hash, verify_password, create_access_token, get_current_user_from_token, require_admin
 
 router = APIRouter(prefix="/users", tags=["users"])
 
@@ -88,11 +88,45 @@ def get_current_user(current_user: dict = Depends(get_current_user_from_token), 
     return user
 
 
-@router.get("", response_model=List[UserResponse])
-def get_users(skip: int = 0, limit: int = 100, db: Session = Depends(get_db), admin_user: dict = Depends(require_admin)):
+@router.get("", response_model=UserListResponse)
+def get_users(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(10, ge=1, le=100),
+    sort_order: str = Query("desc", pattern="^(asc|desc)$"),
+    skip: Optional[int] = Query(None, ge=0),
+    limit: Optional[int] = Query(None, ge=1, le=100),
+    db: Session = Depends(get_db),
+    admin_user: dict = Depends(require_admin),
+):
     """Get list of all users (ADMIN ONLY)"""
-    users = db.query(User).offset(skip).limit(limit).all()
-    return users
+    if limit is not None:
+        page_size = limit
+    if skip is not None:
+        page = (skip // page_size) + 1
+
+    base_query = db.query(User)
+    total = base_query.count()
+    total_pages = (total + page_size - 1) // page_size if total > 0 else 0
+    offset = (page - 1) * page_size
+
+    if sort_order == "asc":
+        base_query = base_query.order_by(User.created_at.asc())
+    else:
+        base_query = base_query.order_by(User.created_at.desc())
+
+    users = base_query.offset(offset).limit(page_size).all()
+
+    return {
+        "items": users,
+        "meta": {
+            "page": page,
+            "page_size": page_size,
+            "total": total,
+            "total_pages": total_pages,
+            "has_next": page < total_pages,
+            "has_prev": page > 1 and total_pages > 0,
+        },
+    }
 
 
 @router.get("/{user_id}", response_model=UserResponse)
