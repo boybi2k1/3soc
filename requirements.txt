@@ -1,15 +1,46 @@
-fastapi
-uvicorn[standard]
-ultralytics
-opencv-python
-python-multipart
-websockets 
-psutil
-passlib[bcrypt]
-python-jose[cryptography]
-sqlalchemy
-passlib[bcrypt]
-pydantic[email]
-pymysql
-mysql-connector-python
-argon2-cffi
+# ============================================================
+# 3SOC - Traffic Violation Detection System
+# Requirements file - Python 3.10+
+# ============================================================
+
+# --- Web Framework ---
+fastapi==0.128.0              # Framework REST API chính
+uvicorn[standard]==0.40.0     # ASGI server chạy FastAPI (bao gồm websockets, watchfiles, httptools)
+
+# --- AI / Computer Vision ---
+ultralytics==8.3.251          # YOLOv8/v11 - framework load model .pt và chạy inference
+opencv-python==4.12.0.88      # Đọc video, decode frame, xử lý ảnh
+torch==2.9.1                  # PyTorch - deep learning backend (YOLO chạy trên torch)
+torchvision==0.24.1           # Thư viện vision bổ trợ cho PyTorch
+numpy==2.2.6                  # Xử lý mảng số, thao tác pixel frame
+pillow==12.1.0                # Đọc/ghi ảnh (YOLO render kết quả detection)
+
+# --- Database ---
+sqlalchemy==2.0.45            # ORM - map Python class <-> bảng MySQL
+pymysql==1.1.2                # MySQL driver thuần Python cho SQLAlchemy
+mysql-connector-python==9.5.0 # Driver kết nối MySQL (alternative connector)
+
+# --- Authentication & Security ---
+python-jose[cryptography]==3.5.0  # Tạo và xác thực JWT (HS256)
+passlib[argon2]==1.7.4            # Framework hash mật khẩu (dùng thuật toán argon2)
+argon2-cffi==25.1.0               # Backend Argon2 cho passlib (thuật toán hash mạnh nhất hiện tại)
+cryptography==46.0.3              # Thư viện mật mã cho python-jose
+
+# --- Request Handling ---
+python-multipart==0.0.21      # Xử lý multipart/form-data (upload file qua API)
+websockets==16.0              # Hỗ trợ WebSocket protocol
+
+# --- Data Validation ---
+pydantic[email]==2.12.5       # Validation request/response schema (tích hợp sẵn FastAPI)
+email-validator==2.3.0        # Validate định dạng email trong Pydantic
+
+# --- Environment ---
+python-dotenv==1.2.1          # Đọc biến môi trường từ file .env
+
+# --- System Monitoring ---
+psutil==7.2.1                 # Lấy thông số CPU%, RAM% broadcast qua WebSocket
+
+# --- Utilities ---
+requests==2.32.5              # HTTP client (dùng bởi ultralytics để download model)
+scipy==1.16.3                 # Tính toán khoa học (dependency của ultralytics)
+matplotlib==3.10.8            # Vẽ biểu đồ/plot (dependency của ultralytics)

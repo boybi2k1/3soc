@@ -35,11 +35,8 @@ class WebSocketManager:
         self.stats_task = None
         self.save_worker_task = None
 
-        self.output_dir = Path("violations")
-        self.output_dir.mkdir(exist_ok=True)
-
         # Limit how frequently violation frames are persisted per video stream.
-        self.SAVE_COOLDOWN_SECONDS: float = 3.0
+        self.SAVE_COOLDOWN_SECONDS: float = 2.0
         self.last_saved_at_ms: Dict[str, float] = {}
 
     # -----------------------------

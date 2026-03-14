@@ -1,8 +1,0 @@
-alembic
-sqlalchemy
-psycopg2-binary
-celery
-redis
-python-dotenv
-boto3
-pytest

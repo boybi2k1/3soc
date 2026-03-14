@@ -29,18 +29,17 @@ MODELS = {
     "duongluoibo": Path("models/duongluoibo.pt"),
     "vnmap": Path("models/vnmap.pt"),
 }
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+DEVICE_STR = DEVICE
 _LOADED_MODELS = {}
 for name, path in MODELS.items():
     if path.exists():
         try:
             # load model onto desired device
             _LOADED_MODELS[name] = YOLO(str(path))
-            print(f"[INFO] loaded model {name} on {DEVICE}")
+            print(f"[INFO] loaded model {name} on {DEVICE_STR}")
         except Exception as e:
             print(f"[WARN] failed to load model {name}: {e}")
-
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-DEVICE_STR = DEVICE
 logger = logging.getLogger("3soc")
 
 app = FastAPI(title="YOLO Flag Detection API")
