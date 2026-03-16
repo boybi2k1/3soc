@@ -238,7 +238,7 @@ class WebSocketManager:
 
         try:
 
-            results = model(frame, device=self.device)
+            results = model(frame, device=self.device, save=False, verbose=False)
 
             if results and len(results) > 0:
 
