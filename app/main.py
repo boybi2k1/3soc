@@ -248,11 +248,13 @@ async def stream_files(video_id: str):
             while True:
 
                 data = await queue.get()
+                
+                payload = {
+                    "type": "violation",
+                    "data": data
+                }
 
-                yield f"data: {json.dumps({
-                    'type': 'violation',
-                    'data': data
-                })}\n\n"
+                yield f"data: {json.dumps(payload)}\n\n"
 
         except asyncio.CancelledError:
             ws_manager.remove_sse(video_id)

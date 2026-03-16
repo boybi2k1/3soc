@@ -1,6 +1,6 @@
 from sqlalchemy import Column, Integer, String, DateTime, Text, JSON, Float, ForeignKey, Boolean
 from sqlalchemy.sql import func
-from sqlalchemy.orm import relationship
+from sqlalchemy.orm import relationship, backref
 from app.db.db import Base
 
 
@@ -37,12 +37,19 @@ class VideoFile(Base):
     owner = relationship("User", back_populates="video_files")
 
 
-class Detection(Base):
-    __tablename__ = "detections"
-    id = Column(Integer, primary_key=True, index=True)
-    detection_id = Column(String(64), unique=True, index=True, nullable=False)
-    source = Column(String(255))
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    results = Column(JSON, nullable=True)
-    summary = Column(JSON, nullable=True)
 
+class Violation(Base):
+    __tablename__ = "violations"
+
+    id           = Column(Integer, primary_key=True, autoincrement=True)
+    video_id     = Column(String(64), ForeignKey("video_files.id"), nullable=False, index=True)
+    frame_number = Column(Integer, nullable=False)
+    timestamp    = Column(Float, nullable=False)        # milliseconds
+    image_path   = Column(String(500), nullable=False)  # web path: /uploads/violations/...
+    detections   = Column(JSON, nullable=False)         # [{x,y,width,height,label,confidence}]
+    created_at   = Column(DateTime(timezone=True), server_default=func.now())
+
+    video = relationship(
+        "VideoFile",
+        backref=backref("violations", cascade="all, delete-orphan")
+    )

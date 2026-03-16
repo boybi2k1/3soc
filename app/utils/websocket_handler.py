@@ -11,6 +11,8 @@ import numpy as np # type: ignore
 import psutil # type: ignore
 from fastapi import WebSocket # type: ignore
 from app.config import UPLOAD_DIR
+from app.db.db import SessionLocal
+from app.db.models import Violation
 logger = logging.getLogger("3soc")
 
 
@@ -37,7 +39,8 @@ class WebSocketManager:
 
         # Limit how frequently violation frames are persisted per video stream.
         self.SAVE_COOLDOWN_SECONDS: float = 2.0
-        self.last_saved_at_ms: Dict[str, float] = {}
+        # Cooldown per video per label: {video_id: {label: last_saved_ms}}
+        self.last_saved_at_ms: Dict[str, Dict[str, float]] = {}
 
     # -----------------------------
     # Connection management
@@ -280,10 +283,20 @@ class WebSocketManager:
 
             try:
 
-                last_saved_ms = self.last_saved_at_ms.get(video_id, 0)
-                # Skip disk writes if we are inside cooldown window for this video.
-                if (timestamp - last_saved_ms) / 1000 < self.SAVE_COOLDOWN_SECONDS:
+                label_ts = self.last_saved_at_ms.setdefault(video_id, {})
+
+                # Lọc những label còn trong cooldown
+                eligible = [
+                    b for b in boxes
+                    if (timestamp - label_ts.get(b.get("label", ""), 0)) / 1000 >= self.SAVE_COOLDOWN_SECONDS
+                ]
+
+                if not eligible:
                     continue
+
+                # Cập nhật last_saved_ms cho các label vừa được lưu
+                for b in eligible:
+                    label_ts[b.get("label", "")] = timestamp
 
                 result = await asyncio.to_thread(
                     save_violation_frame,
@@ -291,13 +304,13 @@ class WebSocketManager:
                     video_id,
                     frame_number,
                     timestamp,
-                    boxes
+                    eligible
                 )
 
-                self.last_saved_at_ms[video_id] = timestamp
                 # push event to SSE
                 if video_id in self.sse_queues:
                     await self.sse_queues[video_id].put(result)
+
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -335,29 +348,37 @@ def get_websocket_manager():
 
 
 def save_violation_frame(frame, detection_id, frame_number, timestamp, detections):
+    # 1. Lưu ảnh .jpg (giữ nguyên)
     violation_dir = UPLOAD_DIR / "violations" / detection_id
     violation_dir.mkdir(parents=True, exist_ok=True)
 
-    safe_ts = f"{timestamp:08.2f}" 
+    safe_ts = f"{timestamp:08.2f}"
     frame_filename = f"ts_{safe_ts}_f{frame_number}.jpg"
-    frame_path = violation_dir / frame_filename
+    cv2.imwrite(str(violation_dir / frame_filename), frame)
 
-    # Lưu ảnh
-    cv2.imwrite(str(frame_path), frame)
+    image_path = f"/uploads/violations/{detection_id}/{frame_filename}"
 
-    metadata_filename = f"ts_{safe_ts}_f{frame_number}_metadata.json"
-    metadata_file = violation_dir / metadata_filename
+    # 2. INSERT vào DB (thay thế JSON write)
+    db = SessionLocal()
+    try:
+        db.add(Violation(
+            video_id=detection_id,
+            frame_number=frame_number,
+            timestamp=round(timestamp, 2),
+            image_path=image_path,
+            detections=detections,
+        ))
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        logger.error(f"[SaveViolation] DB insert failed: {e}")
+    finally:
+        db.close()
 
-    with open(metadata_file, "w") as f:
-        json.dump({
-            "frame_number": frame_number,
-            "timestamp": round(timestamp, 2),
-            "detections": detections
-        }, f)
-
+    # 3. Trả về dict (shape giữ nguyên)
     return {
         "frame_number": frame_number,
         "timestamp": round(timestamp, 2),
-        "image_path": f"/uploads/violations/{detection_id}/{frame_filename}",
-        "detections": detections
+        "image_path": image_path,
+        "detections": detections,
     }

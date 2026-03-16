@@ -10,13 +10,14 @@
 1. [Tổng quan hệ thống](#1-tổng-quan-hệ-thống)
 2. [Yêu cầu cài đặt](#2-yêu-cầu-cài-đặt)
 3. [Cách chạy dự án](#3-cách-chạy-dự-án)
-4. [Tổ chức thư mục (giải thích chi tiết)](#4-tổ-chức-thư-mục)
+4. [Tổ chức thư mục](#4-tổ-chức-thư-mục)
 5. [Cơ sở dữ liệu](#5-cơ-sở-dữ-liệu)
 6. [API Endpoints](#6-api-endpoints)
 7. [Các luồng chức năng chính](#7-các-luồng-chức-năng-chính)
-8. [Xác thực & Phân quyền](#8-xác-thực--phân-quyền)
-9. [Mô hình AI](#9-mô-hình-ai)
-10. [Tài khoản mặc định](#10-tài-khoản-mặc-định)
+8. [Quy tắc cooldown — tránh lưu trùng](#8-quy-tắc-cooldown--tránh-lưu-trùng)
+9. [Xác thực & Phân quyền](#9-xác-thực--phân-quyền)
+10. [Mô hình AI](#10-mô-hình-ai)
+11. [Tài khoản mặc định](#11-tài-khoản-mặc-định)
 
 ---
 
@@ -26,7 +27,7 @@ Dự án **3soc** là phần **Backend** (máy chủ) của hệ thống. Nó đ
 
 - Nhận video/ảnh từ phía người dùng (qua Frontend `admin-web`)
 - Chạy 3 mô hình AI (YOLO) để phát hiện vi phạm
-- Lưu kết quả vào database MySQL và ổ đĩa
+- Lưu ảnh frame vi phạm vào ổ đĩa, metadata vào database MySQL
 - Cung cấp API REST, WebSocket, SSE cho Frontend
 
 ```
@@ -36,8 +37,8 @@ Frontend (admin-web)
         ▼
 Backend (3soc) ← FastAPI, port 8000
         │
-        ├── MySQL Database (lưu user, video, detection)
-        ├── Ổ đĩa /uploads/ (lưu file video, ảnh vi phạm)
+        ├── MySQL Database (lưu user, video, violations)
+        ├── Ổ đĩa /uploads/ (lưu file video, ảnh vi phạm .jpg)
         └── AI Models (3soc.pt, duongluoibo.pt, vnmap.pt)
 ```
 
@@ -78,7 +79,7 @@ CREATE DATABASE detect_3soc CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 
 ### Bước 2: Cấu hình kết nối database
 
-Tạo file `.env` ở thư mục gốc (hoặc chỉnh sửa nếu đã có):
+Tạo file `.env` ở thư mục gốc:
 
 ```env
 DATABASE_URL=mysql+pymysql://root:YOUR_PASSWORD@localhost/detect_3soc
@@ -108,16 +109,9 @@ Script này tự động: tạo môi trường ảo Python, cài thư viện, t�
 
 **Cách 2 — Thủ công:**
 ```bash
-# Tạo môi trường ảo
 python -m venv venv
-
-# Kích hoạt (Windows)
-venv\Scripts\activate
-
-# Cài thư viện
+venv\Scripts\activate        # Windows
 pip install -r requirements.txt
-
-# Chạy server
 uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
@@ -126,6 +120,8 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 Mở trình duyệt: **http://localhost:8000/docs**
 
 Nếu thấy giao diện Swagger UI → server đã chạy thành công ✅
+
+> **Lưu ý:** Bảng trong MySQL được tạo **tự động** khi server khởi động lần đầu, không cần chạy script SQL thủ công.
 
 ---
 
@@ -141,17 +137,17 @@ Nếu thấy giao diện Swagger UI → server đã chạy thành công ✅
 │   ├── config.py               ← Cấu hình đường dẫn (thư mục uploads)
 │   │
 │   ├── db/                     ← Tầng database
-│   │   ├── db.py               ← Kết nối MySQL, tạo bảng, seed user mặc định
-│   │   └── models.py           ← Định nghĩa cấu trúc bảng (User, VideoFile, Detection)
+│   │   ├── db.py               ← Kết nối MySQL, tạo bảng tự động, seed user mặc định
+│   │   └── models.py           ← Định nghĩa cấu trúc bảng (User, VideoFile, Violation)
 │   │
 │   ├── routers/                ← Xử lý các API endpoint
 │   │   ├── users.py            ← Đăng ký, đăng nhập, quản lý user
 │   │   └── files.py            ← Upload video, xem danh sách, detect, xoá
 │   │
 │   ├── schemas/                ← Định nghĩa kiểu dữ liệu vào/ra của API
-│   │   ├── user.py             ← Schema cho user (tạo, cập nhật, response...)
+│   │   ├── user.py             ← Schema cho user
 │   │   ├── file.py             ← Schema cho file video
-│   │   └── response.py         ← Schema dùng chung (pagination, detection result...)
+│   │   └── response.py         ← Schema dùng chung
 │   │
 │   └── utils/                  ← Các tiện ích dùng chung
 │       ├── auth.py             ← Mã hoá mật khẩu, tạo/xác thực JWT token
@@ -159,41 +155,27 @@ Nếu thấy giao diện Swagger UI → server đã chạy thành công ✅
 │       └── websocket_handler.py← Quản lý WebSocket, nhận frame, lưu vi phạm
 │
 ├── models/                     ← File mô hình AI (*.pt) — KHÔNG commit lên Git
-│   ├── 3soc.pt
-│   ├── duongluoibo.pt
-│   └── vnmap.pt
 │
 ├── uploads/                    ← Thư mục lưu file người dùng upload (tạo tự động)
 │   ├── {video_id}.mp4          ← Video đã upload
-│   ├── temp/                   ← Ảnh tạm thời (xoá sau khi detect xong)
-│   └── violations/             ← Ảnh và metadata vi phạm
+│   ├── temp/                   ← Ảnh tạm thời khi detect ảnh (xoá sau khi xong)
+│   └── violations/             ← Ảnh frame vi phạm (*.jpg)
 │       └── {video_id}/
-│           ├── ts_00001250_f42.jpg          ← Ảnh frame vi phạm
-│           └── ts_00001250_f42_metadata.json← Thông tin vi phạm của frame đó
+│           └── ts_00001250_f42.jpg   ← Ảnh frame vi phạm (metadata lưu trong DB)
 │
-├── venv/                       ← Môi trường Python ảo (tạo tự động, KHÔNG commit)
-│
-├── requirements.txt            ← Danh sách thư viện Python cần cài
-├── run.bat                     ← Script khởi động trên Windows
-├── infer_yolo.py               ← Script test chạy AI độc lập (không liên quan server)
-├── .env                        ← Cấu hình môi trường (DATABASE_URL, SECRET_KEY)
-└── .gitignore
+├── requirements.txt
+├── run.bat
+└── .env
 ```
 
-### Giải thích luồng đọc code cho người mới
-
-> **Muốn hiểu server khởi động thế nào?** → Đọc `app/main.py`
-> **Muốn hiểu database có gì?** → Đọc `app/db/models.py`
-> **Muốn hiểu API user (login, register...)?** → Đọc `app/routers/users.py`
-> **Muốn hiểu AI chạy thế nào?** → Đọc `app/utils/tasks.py` và `app/utils/websocket_handler.py`
-> **Muốn hiểu dữ liệu vào/ra của API?** → Đọc `app/schemas/`
+> **Lưu ý quan trọng:** Trước đây mỗi frame vi phạm lưu kèm file `_metadata.json` trên ổ đĩa. **Hiện tại metadata đã được chuyển hoàn toàn vào bảng `violations` trong MySQL** — trên ổ đĩa chỉ còn file ảnh `.jpg`.
 
 ---
 
 ## 5. Cơ sở dữ liệu
 
 Database: **MySQL**, tên: `detect_3soc`
-ORM: **SQLAlchemy** — Python tự tạo bảng khi khởi động (`init_db()` trong `app/db/db.py`)
+ORM: **SQLAlchemy** — Python tự tạo bảng khi khởi động (`Base.metadata.create_all()`)
 
 ### Bảng `users` — Lưu thông tin người dùng
 
@@ -221,56 +203,50 @@ ORM: **SQLAlchemy** — Python tự tạo bảng khi khởi động (`init_db()`
 | `file_size` | INT | Dung lượng file (bytes) |
 | `duration` | FLOAT | Thời lượng video (giây) |
 | `status` | VARCHAR(50) | Trạng thái: `uploaded` / `processing` / `completed` / `error` |
-| `detection_id` | VARCHAR(64) | Liên kết đến thư mục lưu vi phạm |
+| `detection_id` | VARCHAR(64) | Liên kết đến thư mục lưu ảnh vi phạm |
 | `created_at` | DATETIME | Thời gian upload |
 
 ---
 
-### Bảng `detections` — Lưu kết quả phát hiện theo batch
+### Bảng `violations` — Lưu từng frame vi phạm phát hiện được
+
+Mỗi frame vi phạm được lưu thành **1 row** trong bảng này. Khi xoá video, toàn bộ violations liên quan tự động bị xoá theo (cascade).
 
 | Cột | Kiểu dữ liệu | Mô tả |
 |-----|-------------|-------|
 | `id` | INT (PK) | ID tự tăng |
-| `detection_id` | VARCHAR(64) | Mã phiên detect, **duy nhất** |
-| `source` | VARCHAR(255) | File nguồn |
-| `created_at` | DATETIME | Thời gian tạo |
-| `results` | JSON | Danh sách tất cả bounding box tìm được |
-| `summary` | JSON | Thống kê theo từng model |
+| `video_id` | VARCHAR(64) (FK → video_files.id) | Video chứa frame vi phạm này |
+| `frame_number` | INT | Số thứ tự frame trong video |
+| `timestamp` | FLOAT | Thời điểm frame trong video (milliseconds) |
+| `image_path` | VARCHAR(500) | Đường dẫn web tới ảnh `.jpg` (ví dụ: `/uploads/violations/abc/ts_...jpg`) |
+| `detections` | JSON | Danh sách vi phạm trong frame: `[{x, y, width, height, label, confidence}]` |
+| `created_at` | DATETIME | Thời điểm lưu vào DB |
 
----
-
-### File vi phạm lưu trên ổ đĩa (không phải trong DB)
-
-Khi phát hiện vi phạm, hệ thống lưu vào `uploads/violations/{video_id}/`:
-
-**Ảnh frame:** `ts_00001250_f42.jpg`
-**Metadata JSON:** `ts_00001250_f42_metadata.json`
-
-Nội dung file metadata:
+**Ví dụ một row trong `violations`:**
 ```json
 {
+  "id": 1,
+  "video_id": "1234567890",
   "frame_number": 42,
-  "timestamp": 1250.00,
+  "timestamp": 1400.00,
+  "image_path": "/uploads/violations/1234567890/ts_00001400_f42.jpg",
   "detections": [
-    {
-      "x": 100,
-      "y": 200,
-      "width": 80,
-      "height": 60,
-      "label": "co3soc",
-      "confidence": 0.9234
-    }
+    { "x": 100, "y": 200, "width": 80, "height": 60, "label": "co3soc",      "confidence": 0.9234 },
+    { "x": 300, "y": 150, "width": 60, "height": 50, "label": "duongluoibo", "confidence": 0.8811 }
   ]
 }
 ```
+
+> **Một frame có thể chứa nhiều loại vi phạm** — tất cả được gom vào mảng `detections` của cùng 1 row.
 
 ---
 
 ### Sơ đồ quan hệ
 
 ```
-users (1) ──────────── (N) video_files
-  id ◄──────────────────── user_id
+users (1) ────────────── (N) video_files (1) ────────────── (N) violations
+  id ◄──────────────────── user_id              id ◄──────────── video_id
+                                                                  (cascade delete)
 ```
 
 ---
@@ -302,9 +278,9 @@ users (1) ──────────── (N) video_files
 |--------|----------|---------------|-------|
 | POST | `/api/files/upload` | Có | Upload video (multipart/form-data) |
 | GET | `/api/files` | Có | Danh sách file (user thấy của mình, admin thấy tất cả) |
-| DELETE | `/api/files/{id}` | Có | Xoá file video |
-| POST | `/api/files/detect-image` | Tuỳ chọn | Upload ảnh → detect ngay, trả kết quả |
-| GET | `/api/files/{id}/detect-stream` | Không | **SSE stream** kết quả detect video theo batch |
+| DELETE | `/api/files/{id}` | Có | Xoá file video + ảnh vi phạm + rows violations |
+| POST | `/api/files/detect-image` | Tuỳ chọn | Upload ảnh → detect ngay, trả kết quả (không lưu) |
+| GET | `/api/files/{id}/detect-stream` | Không | **SSE** — stream kết quả detect video |
 
 ---
 
@@ -312,8 +288,8 @@ users (1) ──────────── (N) video_files
 
 | Giao thức | Đường dẫn | Mô tả |
 |-----------|-----------|-------|
-| WebSocket | `ws://localhost:8000/realtime` | Gửi frame ảnh, nhận kết quả detect real-time |
-| SSE (GET) | `/file-stream/{video_id}` | Nhận thông báo khi có vi phạm được lưu |
+| WebSocket | `ws://localhost:8000/realtime` | Gửi frame ảnh lên, nhận kết quả detect real-time |
+| SSE (GET) | `/file-stream/{video_id}` | Nhận thông báo khi có vi phạm được lưu (real-time) |
 
 ---
 
@@ -321,7 +297,7 @@ users (1) ──────────── (N) video_files
 
 | Đường dẫn | Mô tả |
 |-----------|-------|
-| `/uploads/*` | Truy cập file video, ảnh vi phạm đã lưu |
+| `/uploads/*` | Truy cập file video, ảnh vi phạm đã lưu trên disk |
 
 ---
 
@@ -329,103 +305,119 @@ users (1) ──────────── (N) video_files
 
 ### Luồng 1: Phát hiện real-time qua WebSocket
 
-Đây là luồng chính khi người dùng phát video trực tiếp trên trang chủ:
+Người dùng mở video trên trang chủ, Frontend gửi từng frame lên để detect:
 
 ```
-[Frontend] Chọn file video
-    │
-    ▼
-[Frontend] Upload video → POST /api/files/upload
-    │  Server lưu file vào uploads/, tạo record DB
+[Frontend] Chọn file video → upload lên server
+    │  POST /api/files/upload
+    │  Server lưu file vào uploads/, tạo record trong bảng video_files
     │
     ▼
 [Frontend] Mở WebSocket → ws://localhost:8000/realtime
+           Mở SSE      → GET /file-stream/{video_id}
     │
     ▼
-[Frontend] Mỗi 200ms: chụp 1 frame từ video đang phát
-           Gửi qua WebSocket dạng JSON:
+[Frontend] Cứ mỗi 200ms: chụp 1 frame từ video đang phát
+           Gửi qua WebSocket:
            {
              "type": "frame",
              "frameData": "data:image/jpeg;base64,...",
-             "timestamp": 1250,
+             "timestamp": 1400,        ← ms tính từ đầu video
              "videoId": "1234567890"
            }
     │
     ▼
-[Backend] WebSocketManager.handle_frame():
-    │  1. Giải mã base64 → numpy array
-    │  2. Chạy 3 model YOLO song song (asyncio.to_thread)
-    │  3. Gộp tất cả bounding box lại
-    │  4. Nếu có vi phạm → đẩy vào save_queue
-    │  5. Gửi kết quả ngay cho client:
-    │     { "type": "detection", "timestamp": 1250,
-    │       "boxes": [{"x":100,"y":200,"width":80,"height":60,
-    │                  "label":"co3soc","confidence":0.92}] }
+[Backend] Nhận frame → chạy 3 model YOLO song song
+          → Gửi kết quả ngay về Frontend (để vẽ bounding box lên màn hình):
+          {
+            "type": "detection",
+            "timestamp": 1400,
+            "boxes": [
+              { "x":100, "y":200, "width":80, "height":60,
+                "label": "co3soc", "confidence": 0.92 }
+            ]
+          }
+    │
+    │  (song song)
+    ▼
+[Backend] Nếu có vi phạm → đưa vào hàng đợi save_queue
+          save_worker() chạy nền:
+            1. Kiểm tra cooldown theo từng label (xem mục 8)
+            2. Lưu ảnh frame → uploads/violations/{video_id}/ts_...jpg
+            3. INSERT 1 row vào bảng violations (DB)
+            4. Gửi event qua SSE channel của video đó
     │
     ▼
-[Backend] save_worker() (chạy nền):
-    │  - Chờ item từ save_queue
-    │  - Kiểm tra cooldown 2 giây (tránh lưu quá nhiều)
-    │  - Lưu frame JPEG vào uploads/violations/{video_id}/
-    │  - Lưu metadata JSON cạnh file ảnh
-    │  - Gửi event vào sse_queues[video_id]
-    │
-    ▼
-[Backend] SSE /file-stream/{video_id}:
-    Gửi event tới Frontend:
-    { "type": "violation", "data": { frame_number, timestamp,
-                                     image_path, detections } }
-    │
-    ▼
-[Frontend] Hiển thị thumbnail vi phạm ở cuối trang
+[Frontend] Nhận SSE event:
+           { "type": "violation", "data": { frame_number, timestamp,
+                                            image_path, detections } }
+           → Hiển thị thumbnail ảnh vi phạm ở cuối trang
 ```
 
 ---
 
-### Luồng 2: Phát hiện batch video đã upload (SSE)
+### Luồng 2: Scan video đã upload (SSE batch)
 
-Khi người dùng bấm "Chon xem chi tiet" ở trang Files:
+Người dùng vào trang Files, bấm xem chi tiết một video:
 
 ```
 [Frontend] Bấm "Scan" → GET /api/files/{id}/detect-stream
     │
     ▼
-[Backend] Kiểm tra: đã có kết quả cache chưa?
+[Backend] Kiểm tra bảng violations: video này đã có kết quả chưa?
     │
-    ├── CÓ CACHE → Stream toàn bộ vi phạm đã lưu ngay:
-    │    SSE: init → metadata → violation × N → complete
-    │
-    └── CHƯA CÓ → Bắt đầu detect:
-         
-         1. Thread read_frames(): đọc video, lấy 1 frame mỗi 0.25s
-         2. Thread detect_worker(): gọi run_detection_on_frame()
-         3. Kết quả → lưu file JPEG + JSON → yield SSE event
-         4. Kết thúc: status = "completed"
-         SSE: init → metadata → violation × N → complete
+    ├── ĐÃ CÓ (cache hit) ──────────────────────────────────────────┐
+    │   Query toàn bộ violations của video từ DB                    │
+    │   Stream ngay về Frontend, không chạy AI lại:                 │
+    │     SSE: init → metadata → violation × N → complete           │
+    │                                                               ▼
+    └── CHƯA CÓ → Bắt đầu detect:                         [Frontend] Hiển thị
+                                                            danh sách vi phạm
+         1. Thread đọc video: lấy 1 frame mỗi 0.25 giây
+         2. Thread detect: chạy 3 model YOLO trên từng frame
+         3. Nếu có vi phạm:
+              - Kiểm tra cooldown theo từng label (xem mục 8)
+              - Lưu ảnh .jpg vào disk
+              - INSERT row vào bảng violations
+              - Yield SSE event về Frontend
+         4. Kết thúc: cập nhật status = "completed"
+              SSE: init → metadata → violation × N → complete
+```
+
+**Cấu trúc SSE event:**
+```
+data: {"type": "init",      "detection_id": "1234567890"}
+data: {"type": "metadata",  "total_frames": 1800, "fps": 30}
+data: {"type": "violation", "data": { "frame_number": 42,
+                                      "timestamp": 1400.0,
+                                      "image_path": "/uploads/violations/.../ts_...jpg",
+                                      "detections": [{...}, {...}] }}
+data: {"type": "complete",  "total_violations": 5}
 ```
 
 ---
 
-### Luồng 3: Phát hiện ảnh tĩnh
+### Luồng 3: Detect ảnh tĩnh
 
 ```
 [Frontend] Chọn file ảnh → POST /api/files/detect-image
     │
     ▼
 [Backend] Lưu ảnh tạm vào uploads/temp/
-    │
-    ▼
-[Backend] Chạy 3 model YOLO trên ảnh
-    │
-    ▼
-[Backend] Xoá file tạm
-    │
-    ▼
-[Backend] Trả về kết quả ngay:
-    { "filename": "...", "detections": [...], "timestamp": "..." }
+          → Chạy 3 model YOLO trên ảnh
+          → Xoá file tạm ngay sau khi xong
+          → Trả về kết quả:
+          {
+            "filename": "anh.jpg",
+            "detections": [ { "x1":100, "y1":200, "x2":180, "y2":260,
+                               "score": 0.92, "label": "co3soc" } ],
+            "timestamp": "2026-03-16T10:00:00Z"
+          }
     │
     ▼
 [Frontend] Vẽ bounding box lên ảnh bằng canvas
+
+※ Ảnh detect đơn lẻ KHÔNG lưu vào DB, KHÔNG lưu disk — chỉ trả kết quả tức thì.
 ```
 
 ---
@@ -436,51 +428,91 @@ Khi người dùng bấm "Chon xem chi tiet" ở trang Files:
 [Frontend] Nhập username + password → POST /api/users/login
     │
     ▼
-[Backend] Tìm user trong DB theo username
-    │
-    ▼
-[Backend] So sánh mật khẩu với Argon2 (verify_password)
-    │
-    ▼
-[Backend] Tạo JWT token (hết hạn sau 7 ngày):
-    payload = { "sub": "admin", "user_id": 1, "role": "admin" }
-    │
-    ▼
-[Backend] Trả về: { "access_token": "...", "token_type": "bearer", "user": {...} }
+[Backend] Tìm user trong DB → kiểm tra mật khẩu (Argon2)
+          → Tạo JWT token (hết hạn sau 7 ngày)
+          → Trả về:
+          {
+            "access_token": "eyJ...",
+            "token_type": "bearer",
+            "user": { "id": 1, "username": "admin", "role": "admin" }
+          }
     │
     ▼
 [Frontend] Lưu token vào localStorage
-           Tất cả request sau sẽ gửi kèm: Authorization: Bearer <token>
+           Tất cả request sau gửi kèm header: Authorization: Bearer <token>
 ```
 
 ---
 
-## 8. Xác thực & Phân quyền
+### Luồng 5: Xoá video
 
-**Thuật toán:** JWT (JSON Web Token) — HS256
-**Mã hoá mật khẩu:** Argon2 (mạnh hơn bcrypt)
-**Thời hạn token:** 7 ngày
-
-### JWT token chứa thông tin:
-```json
-{
-  "sub": "admin",
-  "user_id": 1,
-  "role": "admin",
-  "exp": 1234567890
-}
+```
+[Frontend] Bấm xoá → DELETE /api/files/{id}
+    │
+    ▼
+[Backend] Xoá file video vật lý trên disk (uploads/{id}.mp4)
+          → Xoá record trong bảng video_files
+          → Bảng violations tự xoá toàn bộ rows liên quan (CASCADE)
+          ※ Ảnh .jpg trong uploads/violations/{id}/ KHÔNG tự xoá —
+            cần dọn thủ công hoặc thêm logic sau.
 ```
 
-### Cách kiểm tra quyền:
+---
+
+## 8. Quy tắc cooldown — tránh lưu trùng
+
+**Vấn đề:** Nếu video có vi phạm liên tục trong 30 giây, hệ thống sẽ lưu hàng trăm ảnh giống nhau → tốn disk và DB.
+
+**Giải pháp:** Mỗi label vi phạm có **cooldown 2 giây riêng biệt** — sau khi lưu 1 frame của label đó, phải chờ đủ 2 giây mới lưu tiếp frame tiếp theo của cùng label.
+
+**Ví dụ minh hoạ:**
+
+```
+t = 1000ms  →  phát hiện: [co3soc, duongluoibo]
+               → Lưu cả 2 ✅
+               cooldown: { co3soc: 1000, duongluoibo: 1000 }
+
+t = 1500ms  →  phát hiện: [co3soc, duongluoibo]
+               → Bỏ qua cả 2 ❌ (chưa đủ 2 giây)
+
+t = 2200ms  →  phát hiện: [co3soc, vnmap]
+               → co3soc: đủ 2s (2200-1000=1200ms... chưa đủ) ❌
+               → vnmap:  lần đầu → Lưu ✅
+               cooldown: { co3soc: 1000, duongluoibo: 1000, vnmap: 2200 }
+
+t = 3100ms  →  phát hiện: [co3soc, duongluoibo]
+               → co3soc:      đủ 2s (3100-1000=2100ms) ✅ Lưu
+               → duongluoibo: đủ 2s (3100-1000=2100ms) ✅ Lưu
+               cooldown: { co3soc: 3100, duongluoibo: 3100, vnmap: 2200 }
+```
+
+**Kết quả:** Mỗi loại vi phạm được lưu tối đa **1 lần / 2 giây**, các loại khác nhau không ảnh hưởng lẫn nhau.
+
+Quy tắc này áp dụng cho **cả 2 luồng**:
+- WebSocket real-time (`save_worker` trong `websocket_handler.py`)
+- SSE batch scan (`stream_detection` trong `files.py`)
+
+---
+
+## 9. Xác thực & Phân quyền
+
+**Thuật toán:** JWT (JSON Web Token) — HS256
+**Mã hoá mật khẩu:** Argon2
+**Thời hạn token:** 7 ngày
+
+**JWT token chứa:**
+```json
+{ "sub": "admin", "user_id": 1, "role": "admin", "exp": 1234567890 }
+```
 
 | Dependency | Tác dụng |
 |-----------|---------|
-| `get_current_user_from_token` | Đọc token từ header `Authorization: Bearer ...`, giải mã, trả về thông tin user |
-| `require_admin` | Gọi `get_current_user_from_token`, kiểm tra thêm `role == "admin"`, nếu không → HTTP 403 |
+| `get_current_user_from_token` | Đọc header `Authorization: Bearer ...`, giải mã JWT, trả về thông tin user |
+| `require_admin` | Gọi hàm trên + kiểm tra thêm `role == "admin"`, nếu không → HTTP 403 |
 
 ---
 
-## 9. Mô hình AI
+## 10. Mô hình AI
 
 Ba mô hình **YOLOv8/v11** được load khi server khởi động:
 
@@ -490,28 +522,22 @@ Ba mô hình **YOLOv8/v11** được load khi server khởi động:
 | `duongluoibo` | `models/duongluoibo.pt` | Đường lưỡi bò (bản đồ 9 đoạn của Trung Quốc) |
 | `vnmap` | `models/vnmap.pt` | Bản đồ Việt Nam sai lệch |
 
-**Kết quả detect (bounding box):**
+**Kết quả bounding box trả về Frontend:**
 ```json
-{
-  "x": 100,
-  "y": 200,
-  "width": 80,
-  "height": 60,
-  "label": "co3soc",
-  "confidence": 0.9234
-}
+{ "x": 100, "y": 200, "width": 80, "height": 60,
+  "label": "co3soc", "confidence": 0.9234 }
 ```
 
-**Màu hiển thị trên Frontend:**
+**Màu hiển thị:**
 - `co3soc` → 🔴 Đỏ
 - `duongluoibo` → 🟢 Xanh lá
 - `vnmap` → 🔵 Xanh dương
 
-**GPU/CPU:** Tự động dùng CUDA (GPU) nếu có, fallback sang CPU nếu không.
+**GPU/CPU:** Tự động dùng CUDA nếu có, fallback sang CPU nếu không.
 
 ---
 
-## 10. Tài khoản mặc định
+## 11. Tài khoản mặc định
 
 Khi server khởi động lần đầu, hệ thống tự tạo 2 tài khoản:
 
@@ -520,4 +546,18 @@ Khi server khởi động lần đầu, hệ thống tự tạo 2 tài khoản:
 | `admin` | `admin123` | Admin (toàn quyền) |
 | `user` | `user123` | User thường |
 
-> **Lưu ý bảo mật:** Hãy đổi mật khẩu ngay sau khi deploy lên production!
+> ⚠️ **Hãy đổi mật khẩu ngay sau khi deploy lên production!**
+
+---
+
+## Checklist kiểm tra sau khi deploy (cho Tester)
+
+- [ ] `GET http://localhost:8000/docs` → Swagger UI hiện lên
+- [ ] `POST /api/users/login` với `admin / admin123` → nhận được `access_token`
+- [ ] `POST /api/files/upload` → upload video thành công, DB có row trong `video_files`
+- [ ] `GET /api/files/{id}/detect-stream` → SSE stream chạy, nhận được events `violation`
+- [ ] Sau khi scan: `SELECT * FROM violations WHERE video_id = '{id}';` → có rows, **không có** file `_metadata.json` trên disk
+- [ ] Scan lại video đã scan → nhận ngay kết quả cache (không chạy AI lại)
+- [ ] Xoá video → rows trong `violations` tự biến mất (cascade)
+- [ ] WebSocket real-time → phát video → bounding box hiện trên màn hình, thumbnail vi phạm xuất hiện
+- [ ] Trong 2 giây: 2 loại vi phạm khác nhau → cả 2 đều được lưu riêng biệt ✅

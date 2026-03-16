@@ -2,8 +2,6 @@ from pydantic import json
 from ultralytics import YOLO
 from pathlib import Path
 import torch
-from app.db.db import SessionLocal
-from app.db.models import Detection
 from typing import List, Dict, Any
 import traceback
 import cv2
@@ -125,55 +123,6 @@ def run_detection_on_frame(frame) -> List[Dict[str, Any]]:
         traceback.print_exc()
     
     return aggregate_results
-
-
-def run_detection_on_image(detection_id: str, image_path: str):
-    """
-    Run all available models on image_path and save aggregated results to DB.
-    This runs in-process (background task) and updates the Detection record.
-    """
-    print(f"[TASKS] run_detection_on_image id={detection_id} image={image_path}")
-    results_summary = {}
-    aggregate_results = []
-    try:
-        for model_name, model in _MODELS.items():
-            try:
-                res_list = model(str(image_path))
-                if len(res_list) == 0:
-                    continue
-                res = res_list[0]
-                boxes = _boxes_from_result(res)
-                # attach model name to each box
-                for b in boxes:
-                    b["model"] = model_name
-                aggregate_results.extend(boxes)
-                results_summary[model_name] = {"count": len(boxes)}
-            except Exception as e:
-                print(f"[TASKS] error running model {model_name}: {e}")
-                traceback.print_exc()
-                results_summary[model_name] = {"error": str(e)}
-
-        # save to DB
-        db = SessionLocal()
-        try:
-            record = db.query(Detection).filter(Detection.detection_id == detection_id).first()
-            if record:
-                record.results = aggregate_results
-                record.summary = results_summary
-                db.add(record)
-                db.commit()
-                print(f"[TASKS] saved results for {detection_id} (total_boxes={len(aggregate_results)})")
-            else:
-                print(f"[TASKS] record not found for {detection_id}")
-        except Exception as e:
-            db.rollback()
-            print(f"[TASKS] failed to save results: {e}")
-            traceback.print_exc()
-        finally:
-            db.close()
-    except Exception as e:
-        print(f"[TASKS] unexpected error: {e}")
-        traceback.print_exc()
 
 
 def run_detection_on_image_temp(image_path: str) -> List[Dict[str, Any]]:

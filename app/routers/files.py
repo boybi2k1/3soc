@@ -12,7 +12,7 @@ from uuid import uuid4
 import cv2
 import json
 from app.db.db import SessionLocal
-from app.db.models import VideoFile, Detection
+from app.db.models import VideoFile, Violation
 from app.schemas.file import VideoFileCreate, VideoFileUpdate, VideoFileResponse, VideoFileListResponse
 from app.utils.auth import get_current_user_from_token
 from app.utils import tasks
@@ -193,59 +193,49 @@ def delete_file(file_id: str, db: Session = Depends(get_db)):
 
 
 
-def _load_violations_from_folder(violation_dir: Path, video_id: str) -> list:
-    """Load violation images and metadata from folder."""
-    violations = []
-    
-    # Find all metadata JSON files
-    metadata_files = sorted(violation_dir.glob("*_metadata.json"))
-    
-    for metadata_file in metadata_files:
-        try:
-            with open(metadata_file, 'r') as f:
-                metadata = json.load(f)
-
-            # Try image name derived from metadata file first (supports legacy ts_* format).
-            image_filename = metadata_file.name.replace("_metadata.json", ".jpg")
-            image_path = violation_dir / image_filename
-
-            # Fallback to current frame_* naming if needed.
-            if not image_path.exists():
-                frame_num = metadata.get("frame_number", 0)
-                image_filename = f"frame_{frame_num:05d}_ts{metadata.get('timestamp', 0):.2f}.jpg"
-                image_path = violation_dir / image_filename
-
-            # Last fallback: find any jpg that shares the metadata stem prefix.
-            if not image_path.exists():
-                stem_prefix = metadata_file.stem.replace("_metadata", "")
-                candidates = sorted(violation_dir.glob(f"{stem_prefix}*.jpg"))
-                if candidates:
-                    image_path = candidates[0]
-                    image_filename = image_path.name
-            
-            # Only add if image file exists
-            if not image_path.exists():
-                print(f"[FILES] Warning: Image not found for {metadata_file.name}, skipping")
-                continue
-            
-            violation = {
-                "frame_number": metadata.get("frame_number"),
-                "timestamp": metadata.get("timestamp"),
-                "image_path": f"/uploads/violations/{video_id}/{image_filename}",
-                "detections": metadata.get("detections", []),
+def _load_violations_from_folder(video_id: str) -> list:
+    """Load violation records from DB."""
+    db = SessionLocal()
+    try:
+        rows = (
+            db.query(Violation)
+            .filter(Violation.video_id == video_id)
+            .order_by(Violation.timestamp.asc())
+            .all()
+        )
+        return [
+            {
+                "frame_number": r.frame_number,
+                "timestamp": r.timestamp,
+                "image_path": r.image_path,
+                "detections": r.detections,
             }
-            violations.append(violation)
-        except Exception as e:
-            print(f"[FILES] Error loading metadata {metadata_file}: {e}")
-    
-    return violations
+            for r in rows
+        ]
+    except Exception as e:
+        print(f"[FILES] _load_violations DB error: {e}")
+        return []
+    finally:
+        db.close()
 
 
-def _has_cached_violations(violation_dir: Path) -> bool:
-    """Return True when a violation folder already has saved metadata records."""
-    if not violation_dir.exists() or not violation_dir.is_dir():
+def _has_cached_violations(video_id: str) -> bool:
+    """Return True when there are violation rows in DB for this video."""
+    db = SessionLocal()
+    try:
+        return (
+            db.query(Violation.id)
+            .filter(Violation.video_id == video_id)
+            .limit(1)
+            .scalar()
+            is not None
+        )
+    except Exception as e:
+        print(f"[FILES] _has_cached_violations DB error: {e}")
         return False
-    return any(violation_dir.glob("*_metadata.json"))
+    finally:
+        db.close()
+
 
 
 def _normalize_detections_for_ws_format(detections: list) -> list:
@@ -304,9 +294,9 @@ def detect_file_stream(file_id: str, db: Session = Depends(get_db)):
     # =========================
     # STREAM CACHED RESULT
     # =========================
-    if file.id and _has_cached_violations(violation_dir):
+    if file.id and _has_cached_violations(file_id):
 
-        cached = _load_violations_from_folder(violation_dir, file_id)
+        cached = _load_violations_from_folder(file_id)
 
         def stream_cached():
 
@@ -452,6 +442,9 @@ def detect_file_stream(file_id: str, db: Session = Depends(get_db)):
         yield f"data: {json.dumps({'type':'metadata','total_frames':total_frames,'fps':fps})}\n\n"
 
         done_count = 0
+        SAVE_COOLDOWN_SECONDS = 2.0
+        # Cooldown riêng theo từng label: {"co3soc": 1400, "duongluoibo": 0, ...}
+        last_saved_ms: dict = {}
 
         # -----------------------
         # RESULT LOOP
@@ -472,6 +465,19 @@ def detect_file_stream(file_id: str, db: Session = Depends(get_db)):
             frame = item["frame"]
             detections = item["detections"]
 
+            # Lọc những label còn trong cooldown
+            eligible = [
+                d for d in detections
+                if (timestamp - last_saved_ms.get(d.get("label", ""), 0)) / 1000 >= SAVE_COOLDOWN_SECONDS
+            ]
+
+            if not eligible:
+                continue
+
+            # Cập nhật last_saved_ms cho các label vừa được lưu
+            for d in eligible:
+                last_saved_ms[d.get("label", "")] = timestamp
+
             safe_ts = f"{timestamp:08.2f}"
             frame_filename = f"ts_{safe_ts}_f{frame_number}.jpg"
             frame_path = violation_dir / frame_filename
@@ -480,20 +486,25 @@ def detect_file_stream(file_id: str, db: Session = Depends(get_db)):
 
             violation = {
                 "frame_number": frame_number,
-                "timestamp": round(timestamp,2),
+                "timestamp": round(timestamp, 2),
                 "image_path": f"/uploads/violations/{file_id}/{frame_filename}",
-                "detections": detections
+                "detections": eligible
             }
 
             violation_images.append(violation)
 
-            metadata_file = violation_dir / f"ts_{safe_ts}_f{frame_number}_metadata.json"
-            with open(metadata_file, "w") as f:
-                json.dump({
-                    "frame_number": frame_number,
-                    "timestamp": round(timestamp, 2),
-                    "detections": detections,
-                }, f)
+            try:
+                db_new.add(Violation(
+                    video_id=file_id,
+                    frame_number=frame_number,
+                    timestamp=round(timestamp, 2),
+                    image_path=violation["image_path"],
+                    detections=eligible,
+                ))
+                db_new.commit()
+            except Exception as db_err:
+                db_new.rollback()
+                print(f"[FILES] Violation DB insert error: {db_err}")
 
             yield f"data: {json.dumps({'type':'violation','data':violation})}\n\n"
 
