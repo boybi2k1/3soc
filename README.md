@@ -561,3 +561,202 @@ Khi server khởi động lần đầu, hệ thống tự tạo 2 tài khoản:
 - [ ] Xoá video → rows trong `violations` tự biến mất (cascade)
 - [ ] WebSocket real-time → phát video → bounding box hiện trên màn hình, thumbnail vi phạm xuất hiện
 - [ ] Trong 2 giây: 2 loại vi phạm khác nhau → cả 2 đều được lưu riêng biệt ✅
+
+
+--------------------------------------
+
+ ---
+  Luồng đầy đủ: Upload → WebSocket → SSE
+
+  1. Upload video
+
+  POST /api/files/upload
+    Body: multipart/form-data { file: <video>, video_id: "1234567890" }
+    Header: Authorization: Bearer <token>
+
+  → router: upload_file() [files.py]
+      - Lưu file vào: uploads/{video_id}.mp4
+      - INSERT video_files { id, filename, filepath, user_id, file_size, duration, status="uploaded" }
+      - Return: VideoFileResponse
+
+  ---
+  2. Mở WebSocket + SSE song song
+
+  WS:  ws://localhost:8000/realtime
+  SSE: GET http://localhost:8000/file-stream/{video_id}
+
+  WebSocket connect:
+  → websocket_endpoint() [main.py]
+      → ws_manager.connect(websocket)          # thêm vào active_connections
+      → ws_manager.start_background_tasks()    # khởi động stats_task + save_worker_task (nếu chưa chạy)
+
+  SSE connect:
+  → stream_files(video_id) [main.py]
+      → ws_manager.register_sse(video_id)      # tạo asyncio.Queue, lưu vào sse_queues[video_id]
+      → StreamingResponse(event_stream())      # giữ kết nối, chờ queue
+
+  ---
+  3. Frontend gửi frame qua WebSocket
+
+  WS message: {
+    "type": "frame",
+    "frameData": "data:image/jpeg;base64,/9j/...",
+    "timestamp": 1400,       ← ms từ đầu video
+    "videoId": "1234567890"
+  }
+
+  → websocket_endpoint() nhận → ws_manager.handle_frame(websocket, message)
+
+  Bên trong handle_frame():
+  # 1. Decode base64 → numpy frame
+  # 2. Tăng frame counter
+  frame_number = video_frame_counters[video_id] + 1
+
+  # 3. Chạy 3 model YOLO song song (asyncio.gather + to_thread)
+  tasks = [
+      asyncio.to_thread(run_model, "co3soc",      model, frame),
+      asyncio.to_thread(run_model, "duongluoibo", model, frame),
+      asyncio.to_thread(run_model, "vnmap",        model, frame),
+  ]
+  results = await asyncio.gather(*tasks)
+  boxes = flatten(results)   # gộp tất cả bounding box
+
+  # 4. Trả kết quả ngay về FE (để vẽ bbox real-time)
+  websocket.send({
+    "type": "detection",
+    "timestamp": 1400,
+    "boxes": [{ "x", "y", "width", "height", "label", "confidence" }],
+    "frameSize": { "width", "height" }
+  })
+
+  # 5. Nếu có vi phạm → đẩy vào hàng đợi
+  if boxes:
+      save_queue.put((frame, video_id, frame_number, timestamp, boxes))
+
+  ---
+  4. save_worker() chạy nền xử lý hàng đợi
+
+  # Chạy liên tục trong background task (asyncio)
+  frame, video_id, frame_number, timestamp, boxes = await save_queue.get()
+
+  # Kiểm tra cooldown theo từng label
+  label_ts = last_saved_at_ms[video_id]   # {"co3soc": 1000, "duongluoibo": 800, ...}
+  eligible = [b for b in boxes
+              if (timestamp - label_ts.get(b["label"], 0)) / 1000 >= 2.0]
+
+  if not eligible: continue   # bỏ qua, chưa đủ cooldown
+
+  # Cập nhật cooldown
+  for b in eligible:
+      label_ts[b["label"]] = timestamp
+
+  # Chạy trong thread (tránh block event loop)
+  result = await asyncio.to_thread(save_violation_frame, frame, video_id, ...)
+
+  Bên trong save_violation_frame() [websocket_handler.py]:
+  # 1. Lưu ảnh
+  cv2.imwrite("uploads/violations/{video_id}/ts_{timestamp}_f{frame_number}.jpg", frame)
+
+  # 2. INSERT DB
+  db.add(Violation(
+      video_id=video_id,
+      frame_number=frame_number,
+      timestamp=round(timestamp, 2),
+      image_path="/uploads/violations/{video_id}/ts_...jpg",
+      detections=eligible,   # chỉ những label đã qua cooldown
+  ))
+  db.commit()
+
+  # 3. Return dict
+  return { "frame_number", "timestamp", "image_path", "detections" }
+
+  ---
+  5. Push SSE về Frontend
+
+  # Sau khi save_violation_frame() xong
+  result = { frame_number, timestamp, image_path, detections }
+
+  if video_id in sse_queues:
+      sse_queues[video_id].put(result)   # đẩy vào asyncio.Queue
+
+  # → event_stream() đang chờ queue.get() nhận được
+  # → yield SSE event:
+  data: {"type": "violation", "data": { frame_number, timestamp, image_path, detections }}
+
+  ---
+  Tóm tắt call graph
+
+  FE upload video
+    └─ POST /api/files/upload → INSERT video_files
+
+  FE mở WS + SSE
+    ├─ ws://localhost:8000/realtime
+    │    └─ ws_manager.connect() + start_background_tasks()
+    │         ├─ stats_task     (broadcast CPU/RAM/FPS mỗi 1s)
+    │         └─ save_worker    (loop chờ save_queue)
+    │
+    └─ GET /file-stream/{video_id}
+         └─ register_sse(video_id) → tạo Queue → giữ kết nối chờ
+
+  FE gửi frame mỗi ~200ms
+    └─ WS message {type:"frame"}
+         └─ handle_frame()
+              ├─ run_model() x3 (to_thread) → boxes
+              ├─ WS response {type:"detection", boxes} → FE vẽ bbox
+              └─ save_queue.put(frame, boxes)
+                    └─ save_worker() nhận
+                         ├─ cooldown filter theo label
+                         ├─ save_violation_frame()
+                         │    ├─ cv2.imwrite(.jpg)
+                         │    └─ INSERT violations (DB)
+                         └─ sse_queues[video_id].put(result)
+                                └─ event_stream() yield SSE
+                                     └─ FE nhận → hiển thị thumbnail
+                                     
+  ---------------------
+  Ai ghi DB, ai đọc DB
+
+  GHI DB (1 chỗ duy nhất):
+  ─────────────────────────
+  save_violation_frame()
+    → cv2.imwrite(.jpg)
+    → INSERT violations (DB)     ← ghi 1 lần khi có vi phạm đủ cooldown
+    → return dict
+
+  ĐỌC DB (1 chỗ duy nhất):
+  ─────────────────────────
+  GET /api/files/{id}/detect-stream   ← người dùng bấm Scan ở trang Files
+    → _has_cached_violations(video_id)   → SELECT COUNT từ violations
+    → _load_violations_from_folder(video_id) → SELECT * FROM violations
+    → stream toàn bộ về FE qua SSE
+
+  ---
+  Luồng real-time: KHÔNG đọc DB
+
+  save_worker()
+    → save_violation_frame()
+        → INSERT DB ✅ (ghi)
+        → return { frame_number, timestamp, image_path, detections }
+                          ↓
+                dict này giữ nguyên trong RAM
+                          ↓
+    → sse_queues[video_id].put(dict)   ← push thẳng dict vào Queue (RAM)
+                          ↓
+    event_stream() queue.get()         ← lấy từ Queue (RAM)
+                          ↓
+    yield SSE → FE                     ← KHÔNG đọc DB, dùng dict có sẵn
+
+  ---
+  Tóm lại
+
+  ┌───────────────────────────────────┬───────────────────────────┬─────────────────────────────┐
+  │                                   │          Ghi DB           │           Đọc DB            │
+  ├───────────────────────────────────┼───────────────────────────┼─────────────────────────────┤
+  │ WebSocket real-time               │ ✅ save_violation_frame() │ ❌ không                    │
+  ├───────────────────────────────────┼───────────────────────────┼─────────────────────────────┤
+  │ SSE /file-stream/{id}             │ ❌ không                  │ ❌ không — đọc từ Queue RAM │
+  ├───────────────────────────────────┼───────────────────────────┼─────────────────────────────┤
+  │ SSE /api/files/{id}/detect-stream │ ✅ khi scan mới           │ ✅ khi cache hit            │
+  └───────────────────────────────────┴───────────────────────────┴─────────────────────────────┘
+
+  Queue chỉ là ống dẫn trong RAM — insert DB và push SSE là 2 việc độc lập, xảy ra cùng lúc trong save_worker(), không liên quan nhau.                                   -

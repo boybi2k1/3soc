@@ -107,7 +107,7 @@ def run_detection_on_frame(frame) -> List[Dict[str, Any]]:
     try:
         for model_name, model in _MODELS.items():
             try:
-                res_list = model(frame)
+                res_list = model(frame, save=False, verbose=False)
                 if len(res_list) == 0:
                     continue
                 res = res_list[0]
@@ -134,7 +134,7 @@ def run_detection_on_image_temp(image_path: str) -> List[Dict[str, Any]]:
     try:
         for model_name, model in _MODELS.items():
             try:
-                res_list = model(str(image_path))
+                res_list = model(str(image_path), save=False, verbose=False)
                 if len(res_list) == 0:
                     continue
                 res = res_list[0]
