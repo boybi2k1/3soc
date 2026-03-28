@@ -1,21 +1,11 @@
 import torch
-import asyncio
 import numpy as np
-import cv2
-from fastapi.responses import JSONResponse
 from pathlib import Path
-import uuid
-import shutil
 from ultralytics import YOLO
-from typing import List, Dict, Any
-import torch
-import logging
-import json
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from app.utils.websocket_handler import init_websocket_manager, get_websocket_manager
 from app.routers.users import router as users_router
 from app.routers.files import router as files_router
 from app.db.db import init_db, SessionLocal
@@ -40,8 +30,6 @@ for name, path in MODELS.items():
             print(f"[INFO] loaded model {name} on {DEVICE_STR}")
         except Exception as e:
             print(f"[WARN] failed to load model {name}: {e}")
-logger = logging.getLogger("3soc")
-
 app = FastAPI(title="YOLO Flag Detection API")
 
 
@@ -161,103 +149,9 @@ async def startup_event():
     except Exception as e:
         print(f"[WARN] Model warm-up failed: {e}")
     
-    # Initialize WebSocket manager with loaded models.
-    # Background tasks are started lazily when the first websocket client connects.
-    ws_manager = init_websocket_manager(_LOADED_MODELS, DEVICE_STR)
-    print(f"[INFO] WebSocket manager initialized with {len(_LOADED_MODELS)} models")
-
-
 @app.on_event("shutdown")
 async def shutdown_event():
     """Graceful shutdown"""
     print("[INFO] Shutting down application...")
-    try:
-        ws_manager = get_websocket_manager()
-        if ws_manager:
-            await ws_manager.close_all()
-    except Exception as e:
-        print(f"[WARN] Error during shutdown: {e}")
     print("[INFO] Shutdown complete")
-
-@app.websocket("/realtime")
-async def websocket_endpoint(websocket: WebSocket):
-
-    ws_manager = get_websocket_manager()
-
-    if not ws_manager:
-        await websocket.close(code=1000, reason="WebSocket manager not initialized")
-        return
-
-    await ws_manager.connect(websocket)
-
-    # start background tasks (stats + save worker)
-    await ws_manager.start_background_tasks()
-
-    try:
-
-        while True:
-
-            data = await websocket.receive_text()
-
-            try:
-                message = json.loads(data)
-            except json.JSONDecodeError:
-                logger.warning("[WebSocket] Invalid JSON received")
-                continue
-
-            message_type = message.get("type")
-
-            if message_type == "frame":
-
-                await ws_manager.handle_frame(websocket, message)
-
-            elif message_type == "ping":
-
-                await websocket.send_text(
-                    json.dumps({"type": "pong"})
-                )
-
-            else:
-
-                logger.debug(f"[WebSocket] Unknown message type: {message_type}")
-
-    except WebSocketDisconnect:
-
-        ws_manager.disconnect(websocket)
-        logger.info("[WebSocket] Client disconnected")
-
-    except Exception as e:
-
-        logger.error(f"[WebSocket] Error: {e}")
-        ws_manager.disconnect(websocket)
-
-
-from fastapi.responses import StreamingResponse
-
-@app.get("/file-stream/{video_id}")
-async def stream_files(video_id: str):
-
-    ws_manager = get_websocket_manager()
-
-    queue = await ws_manager.register_sse(video_id)
-
-    async def event_stream():
-
-        try:
-
-            while True:
-
-                data = await queue.get()
-                
-                payload = {
-                    "type": "violation",
-                    "data": data
-                }
-
-                yield f"data: {json.dumps(payload)}\n\n"
-
-        except asyncio.CancelledError:
-            ws_manager.remove_sse(video_id)
-
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
 

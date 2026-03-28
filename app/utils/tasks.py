@@ -1,12 +1,8 @@
-from pydantic import json
 from ultralytics import YOLO
 from pathlib import Path
 import torch
 from typing import List, Dict, Any
 import traceback
-import cv2
-import numpy as np
-from app.config import UPLOAD_DIR
 
 
 # Configure device
@@ -29,53 +25,6 @@ for name, p in MODEL_FILES.items():
             print(f"[TASKS] loaded model {name} on {DEVICE}")
         except Exception as e:
             print(f"[TASKS] failed to load {name}: {e}")
-
-
-def _compute_image_hash(image_path: str) -> str:
-    """Compute a perceptual hash of an image for duplicate detection."""
-    try:
-        img = cv2.imread(image_path)
-        if img is None:
-            return ""
-        # Resize to 8x8
-        img_small = cv2.resize(img, (8, 8))
-        # Convert to grayscale
-        img_gray = cv2.cvtColor(img_small, cv2.COLOR_BGR2GRAY)
-        # Compute mean
-        mean = img_gray.mean()
-        # Create hash: 1 if pixel > mean, 0 otherwise
-        hash_str = "".join(["1" if pixel > mean else "0" for pixel in img_gray.flatten()])
-        return hash_str
-    except Exception as e:
-        print(f"[TASKS] Error computing image hash: {e}")
-        return ""
-
-
-def _image_hash_distance(hash1: str, hash2: str) -> int:
-    """Compute Hamming distance between two image hashes."""
-    if not hash1 or not hash2 or len(hash1) != len(hash2):
-        return float('inf')
-    return sum(c1 != c2 for c1, c2 in zip(hash1, hash2))
-
-
-def _is_duplicate_frame(new_image_path: str, previous_frames: List[Dict], threshold: int = 8) -> bool:
-    """
-    Check if image is similar to any previous frame (using perceptual hash).
-    threshold: Hamming distance threshold (0-64, lower = more similar)
-    """
-    if not previous_frames:
-        return False
-    
-    new_hash = _compute_image_hash(new_image_path)
-    if not new_hash:
-        return False
-    
-    for prev in previous_frames[-5:]:  # Only compare with last 5 frames
-        prev_hash = prev.get("_hash")
-        if prev_hash and _image_hash_distance(new_hash, prev_hash) < threshold:
-            return True
-    
-    return False
 
 
 def _boxes_from_result(res) -> List[Dict[str, Any]]:
@@ -152,30 +101,3 @@ def run_detection_on_image_temp(image_path: str) -> List[Dict[str, Any]]:
         traceback.print_exc()
     
     return aggregate_results
-
-def save_violation_frame(frame, detection_id, frame_number, timestamp, detections):
-
-    violation_dir = UPLOAD_DIR / "violations" / detection_id
-    violation_dir.mkdir(parents=True, exist_ok=True)
-
-    frame_filename = f"frame_{frame_number:05d}_ts{timestamp:.2f}.jpg"
-    frame_path = violation_dir / frame_filename
-
-    # save image
-    cv2.imwrite(str(frame_path), frame)
-
-    metadata_file = violation_dir / f"frame_{frame_number:05d}_metadata.json"
-
-    with open(metadata_file, "w") as f:
-        json.dump({
-            "frame_number": frame_number,
-            "timestamp": round(timestamp, 2),
-            "detections": detections
-        }, f)
-
-    return {
-        "frame_number": frame_number,
-        "timestamp": round(timestamp, 2),
-        "image_path": f"/uploads/violations/{detection_id}/{frame_filename}",
-        "detections": detections
-    }

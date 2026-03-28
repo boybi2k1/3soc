@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, status, UploadFile,Form, File, Header, Query
+﻿from fastapi import APIRouter, Depends, HTTPException, status, UploadFile,Form, File, Header, Query
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session, joinedload
 from typing import List, Optional
@@ -13,7 +13,7 @@ import cv2
 import json
 from app.db.db import SessionLocal
 from app.db.models import VideoFile, Violation
-from app.schemas.file import VideoFileCreate, VideoFileUpdate, VideoFileResponse, VideoFileListResponse
+from app.schemas.file import VideoFileResponse, VideoFileListResponse
 from app.utils.auth import get_current_user_from_token
 from app.utils import tasks
 from app.config import UPLOAD_DIR
@@ -66,7 +66,7 @@ async def upload_file(
     # timestamp = int(os.path.getmtime(__file__) * 1000) if os.path.exists(__file__) else 0
     # file_ext = Path(file.filename).suffix
     # unique_filename = f"{timestamp}_{file.filename}"
-    file_ext = Path(file.filename).suffix # Lấy .mp4, .mov...
+    file_ext = Path(file.filename).suffix # Láº¥y .mp4, .mov...
     actual_path = UPLOAD_DIR / f"{video_id}{file_ext}"
     
     # Save file
@@ -278,7 +278,13 @@ def _normalize_detections_for_ws_format(detections: list) -> list:
 
 
 @router.get("/{file_id}/detect-stream")
-def detect_file_stream(file_id: str, db: Session = Depends(get_db)):
+def detect_file_stream(
+    file_id: str,
+    sample_ms: int = Query(100, ge=50, le=1000),
+    cooldown_ms: int = Query(500, ge=0, le=5000),
+    save_image_ms: int = Query(2000, ge=200, le=10000),
+    db: Session = Depends(get_db),
+):
 
     file = db.query(VideoFile).filter(VideoFile.id == file_id).first()
     if not file:
@@ -341,7 +347,7 @@ def detect_file_stream(file_id: str, db: Session = Depends(get_db)):
 
         stop_event = threading.Event()
 
-        worker_count = 1   # nếu GPU → 1, CPU → 2-4
+        worker_count = 1   # náº¿u GPU â†’ 1, CPU â†’ 2-4
 
         violation_images = []
 
@@ -353,7 +359,7 @@ def detect_file_stream(file_id: str, db: Session = Depends(get_db)):
             cap = cv2.VideoCapture(str(video_path))
 
             fps = cap.get(cv2.CAP_PROP_FPS) or 30
-            frame_interval = max(1, int(fps * 0.25))
+            frame_interval = max(1, int(fps * (sample_ms / 1000)))
 
             frame_index = 0
             sampled_index = 0
@@ -396,18 +402,14 @@ def detect_file_stream(file_id: str, db: Session = Depends(get_db)):
                 try:
 
                     results = tasks.run_detection_on_frame(frame)
+                    normalized_results = _normalize_detections_for_ws_format(results or [])
 
-                    if results:
-                        normalized_results = _normalize_detections_for_ws_format(results)
-                        if not normalized_results:
-                            continue
-
-                        result_queue.put({
-                            "frame_number": frame_number,
-                            "timestamp": timestamp,
-                            "frame": frame,
-                            "detections": normalized_results
-                        })
+                    result_queue.put({
+                        "frame_number": frame_number,
+                        "timestamp": timestamp,
+                        "frame": frame,
+                        "detections": normalized_results
+                    })
 
                 except Exception as e:
                     print("Detection error:", e)
@@ -442,9 +444,12 @@ def detect_file_stream(file_id: str, db: Session = Depends(get_db)):
         yield f"data: {json.dumps({'type':'metadata','total_frames':total_frames,'fps':fps})}\n\n"
 
         done_count = 0
-        SAVE_COOLDOWN_SECONDS = 2.0
-        # Cooldown riêng theo từng label: {"co3soc": 1400, "duongluoibo": 0, ...}
-        last_saved_ms: dict = {}
+        SAVE_COOLDOWN_SECONDS = cooldown_ms / 1000
+        SAVE_IMAGE_SECONDS = save_image_ms / 1000
+        # Cooldown riÃªng theo tá»«ng label cho event violation (áº£nh lÆ°u).
+        last_saved_label_ms: dict = {}
+        # Cooldown toÃ n cá»¥c cho viá»‡c lÆ°u áº£nh thumbnail.
+        last_saved_image_ms = -1.0
 
         # -----------------------
         # RESULT LOOP
@@ -465,18 +470,29 @@ def detect_file_stream(file_id: str, db: Session = Depends(get_db)):
             frame = item["frame"]
             detections = item["detections"]
 
-            # Lọc những label còn trong cooldown
+            # 1) Emit detection liÃªn tá»¥c Ä‘á»ƒ FE váº½ bbox mÆ°á»£t.
+            yield f"data: {json.dumps({'type':'detection','data': {'frame_number': frame_number, 'timestamp': round(timestamp, 2), 'detections': detections}})}\n\n"
+            if not detections:
+                continue
+
+
+            # 2) Chá»‰ chá»n label Ä‘á»§ cooldown Ä‘á»ƒ lÆ°u áº£nh violation.
             eligible = [
                 d for d in detections
-                if (timestamp - last_saved_ms.get(d.get("label", ""), 0)) / 1000 >= SAVE_COOLDOWN_SECONDS
+                if (timestamp - last_saved_label_ms.get(d.get("label", ""), 0)) / 1000 >= SAVE_COOLDOWN_SECONDS
             ]
 
             if not eligible:
                 continue
 
-            # Cập nhật last_saved_ms cho các label vừa được lưu
+            # 3) Cháº·n táº§n suáº¥t lÆ°u áº£nh toÃ n cá»¥c.
+            if last_saved_image_ms >= 0 and (timestamp - last_saved_image_ms) / 1000 < SAVE_IMAGE_SECONDS:
+                continue
+
+            # Cáº­p nháº­t cooldown sau khi quyáº¿t Ä‘á»‹nh lÆ°u.
             for d in eligible:
-                last_saved_ms[d.get("label", "")] = timestamp
+                last_saved_label_ms[d.get("label", "")] = timestamp
+            last_saved_image_ms = float(timestamp)
 
             safe_ts = f"{timestamp:08.2f}"
             frame_filename = f"ts_{safe_ts}_f{frame_number}.jpg"
